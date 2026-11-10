@@ -18,11 +18,11 @@ enum SensitivityLevel: String, CaseIterable {
 enum GestureState: String {
     case idle = "대기 중"
     case pointing = "포인팅"
-    case pinching = "클릭 (탭)"
-    case fingerCurled = "약지 접음 (클릭)"
+    case pinching = "클릭 중 (핀치)"
+    case fingerCurled = "클릭 중 (약지 접음)"
     case dragging = "드래그 중"
     case rightClicking = "우클릭"
-    case scrolling = "스크롤"
+    case scrolling = "스크롤 중"
     case noHand = "손 감지 안됨"
 }
 
@@ -49,6 +49,56 @@ final class GestureEngine {
     var roiMinY: CGFloat = 0.20
     var roiMaxY: CGFloat = 0.80
 
+    // 핀치 임계값
+    var pinchThresholdEnter: CGFloat = 0.38
+    var pinchThresholdExit: CGFloat = 0.48
+    var pinchRawDistMax: CGFloat = 0.058
+
+    // 약지+새끼 접기 임계값 (손목-팁 거리 비율 기반)
+    var curlThresholdEnter: CGFloat = 0.72
+    var curlThresholdExit: CGFloat = 0.85
+
+    // 우클릭 임계값
+    var rightPinchThreshold: CGFloat = 0.28
+    private var lastRightClickTime: CFAbsoluteTime = 0.0
+
+    // 스크롤 모드
+    private var lastScrollY: CGFloat?
+
+    // 마우스 상태 & 240Hz 보간 엔진
+    private let lock = NSLock()
+    private var targetPoint: CGPoint?
+    private var currentPoint: CGPoint?
+    private var isMoving = false
+    private var hasSentSettledEvent = false
+
+    private(set) var isPressed = false
+    private var isDragging = false
+    private var isByCurl = false
+    private var pressStartTime: CFAbsoluteTime = 0.0
+    private var pressAnchorPoint: CGPoint = .zero
+
+    private var history: [(t: CFAbsoluteTime, p: CGPoint)] = []
+
+    private var lastCursorPoint: CGPoint = .zero
+    private(set) var currentState: GestureState = .noHand
+
+    // 필터
+    private let filterX = OneEuro(minCutoff: 1.5, beta: 0.035)
+    private let filterY = OneEuro(minCutoff: 1.5, beta: 0.035)
+
+    var isEnabled: Bool = true {
+        didSet {
+            if !isEnabled {
+                releaseAll()
+            }
+        }
+    }
+
+    init() {
+        startInterpolationThread()
+    }
+
     private func applySensitivity(_ level: SensitivityLevel) {
         switch level {
         case .veryHigh:
@@ -70,65 +120,6 @@ final class GestureEngine {
         }
     }
 
-    // 핀치 임계값
-    var pinchThresholdEnter: CGFloat = 0.38
-    var pinchThresholdExit: CGFloat = 0.48
-    var pinchRawDistMax: CGFloat = 0.058
-
-    // 약지+새끼 접기 임계값
-    var curlThresholdEnter: CGFloat = 0.60
-    var curlThresholdExit: CGFloat = 0.75
-
-    // 우클릭 임계값
-    var rightPinchThreshold: CGFloat = 0.28
-    private var lastRightClickTime: CFAbsoluteTime = 0.0
-
-    // 스크롤 모드
-    private var lastScrollY: CGFloat?
-
-    // 마우스 상태 & 240Hz 보간 엔진
-    private let lock = NSLock()
-    private var targetPoint: CGPoint?
-    private var currentPoint: CGPoint?
-    private var isMoving = false
-    private var hasSentSettledEvent = false
-
-    private(set) var isPinching = false
-    private(set) var isFingerCurled = false
-    private var isDragging = false
-    private var isFrozen = false
-    private var freezeUntilTime: CFAbsoluteTime = 0.0
-
-    private var history: [(t: CFAbsoluteTime, p: CGPoint)] = []
-    private var clickStartTime: CFAbsoluteTime = 0.0
-    private var clickAnchorPoint: CGPoint = .zero
-
-    // 더블 클릭 계산
-    private var lastClickTime: CFAbsoluteTime = 0.0
-    private var lastClickPoint: CGPoint = .zero
-    private var clickCount = 0
-
-    private var lastCursorPoint: CGPoint = .zero
-    private(set) var currentState: GestureState = .noHand
-
-    private let eventSource = CGEventSource(stateID: .hidSystemState)
-
-    // 필터
-    private let filterX = OneEuro(minCutoff: 1.5, beta: 0.035)
-    private let filterY = OneEuro(minCutoff: 1.5, beta: 0.035)
-
-    var isEnabled: Bool = true {
-        didSet {
-            if !isEnabled {
-                releaseAll()
-            }
-        }
-    }
-
-    init() {
-        startInterpolationThread()
-    }
-
     /// 240Hz 고주사율 디스플레이 보간 스레드
     private func startInterpolationThread() {
         let th = Thread { [weak self] in
@@ -137,7 +128,7 @@ final class GestureEngine {
                 self.tick()
 
                 self.lock.lock()
-                let idle = !self.isMoving && !self.isPinching && !self.isFingerCurled
+                let idle = !self.isMoving && !self.isPressed
                 self.lock.unlock()
 
                 usleep(idle ? 16_666 : 4_166)
@@ -150,21 +141,10 @@ final class GestureEngine {
 
     private func tick() {
         lock.lock()
-        let now = CFAbsoluteTimeGetCurrent()
 
-        // 클릭 앵커 동결(Freeze) 상태인 경우 커서 고정
-        if isFrozen || ((isPinching || isFingerCurled) && !isDragging) {
-            let anchor = clickAnchorPoint
-            currentPoint = anchor
-            lock.unlock()
-            CGWarpMouseCursorPosition(anchor)
-            postMouseMovedEvent(at: anchor, dx: 0, dy: 0)
-            return
-        }
-
-        // 릴리즈 후 반동 억제 쿨다운
-        if now < freezeUntilTime {
-            let anchor = clickAnchorPoint
+        // 클릭된 채 정지(탭) 상태일 때는 앵커 포인트 고정
+        if isPressed && !isDragging {
+            let anchor = pressAnchorPoint
             currentPoint = anchor
             lock.unlock()
             CGWarpMouseCursorPosition(anchor)
@@ -187,9 +167,9 @@ final class GestureEngine {
             hasSentSettledEvent = true
             lock.unlock()
 
-            // [핵심] 멈췄을 때 1회의 정지 마우스 이벤트를 전송해야 브라우저가 링크 위에서 손모양(pointer) 커서로 갱신함!
+            // 멈췄을 때 1회의 정지 마우스 이벤트를 전송하여 브라우저가 링크 위에서 손모양(pointer) 커서로 갱신하도록 유도
             if settledNeeded {
-                postMouseMovedEvent(at: c, dx: 0, dy: 0)
+                postMouseMoved(at: c, dx: 0, dy: 0)
             }
             return
         }
@@ -205,10 +185,10 @@ final class GestureEngine {
         lock.unlock()
 
         if dragging {
-            postMouseDraggedEvent(at: c, dx: stepX, dy: stepY)
+            postMouseDragged(at: c, dx: stepX, dy: stepY)
         } else {
             CGWarpMouseCursorPosition(c)
-            postMouseMovedEvent(at: c, dx: stepX, dy: stepY)
+            postMouseMoved(at: c, dx: stepX, dy: stepY)
         }
     }
 
@@ -219,7 +199,7 @@ final class GestureEngine {
         }
 
         guard let hand = hand, hand.isValid, let indexTip = hand.indexTip, let thumbTip = hand.thumbTip else {
-            if isPinching || isFingerCurled {
+            if isPressed {
                 releaseMouse()
             }
             filterX.reset()
@@ -250,19 +230,20 @@ final class GestureEngine {
         let rawTarget = CGPoint(x: targetX, y: targetY)
         lastCursorPoint = rawTarget
 
-        // 핀치 및 접힘 거리 계산
+        // 거리 비율 계산
         let rawDist = hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y)
         let pinchRatio = hand.pinchRatio ?? 1.0
         let middlePinchRatio = hand.middlePinchRatio ?? 1.0
         let curlRatio = hand.lowerFingerCurlRatio
 
-        // 히스토리 버퍼 업데이트
+        // 히스토리 버퍼 (최근 0.5초)
         history.append((now, rawTarget))
-        if history.count > 60 || (history.first.map { now - $0.t > 0.6 } ?? false) {
-            history.removeAll { now - $0.t > 0.6 }
+        if history.count > 50 || (history.first.map { now - $0.t > 0.5 } ?? false) {
+            history.removeAll { now - $0.t > 0.5 }
         }
 
         // 5. 제스처 판정
+
         // A. 엄지-중지 우클릭 감지
         if middlePinchRatio < rightPinchThreshold && pinchRatio > pinchThresholdExit && curlRatio > curlThresholdExit {
             if now - lastRightClickTime > 0.6 {
@@ -273,14 +254,20 @@ final class GestureEngine {
             }
         }
 
-        // B. 두 손가락 스크롤 제스처 판정 (검지+중지 나란히 펴고 약지/엄지 열림)
+        // B. 두 손가락 스크롤 제스처 판정 (검지+중지 나란히 펴고 상하 이동)
         if let midTip = hand.middleTip {
             let fingerDist = hypot(indexTip.x - midTip.x, indexTip.y - midTip.y) / hand.palmScale
-            if fingerDist < 0.22 && pinchRatio > 0.42 && curlRatio > 0.65 {
+            // 두 손가락 팁 거리가 0.38 이하이고, 엄지가 떨어져 있을 때
+            if fingerDist < 0.38 && pinchRatio > 0.35 && !isPressed {
                 if let prevY = lastScrollY {
-                    let dy = (clampedY - prevY) * 380.0
-                    if abs(dy) > 1.0 {
-                        scroll(dy: Double(dy))
+                    // 손을 위로 올리면 (clampedY 감소) 위로 스크롤, 손을 내리면 아래로 스크롤
+                    let dy = clampedY - prevY
+                    if abs(dy) > 0.003 {
+                        // 웹 브라우저가 확실하게 스크롤되도록 라인 단위 및 픽셀 이벤트 전송
+                        let lineSteps = Int32((-dy * 45.0).rounded())
+                        if lineSteps != 0 {
+                            scroll(lines: lineSteps)
+                        }
                     }
                 }
                 lastScrollY = clampedY
@@ -290,178 +277,148 @@ final class GestureEngine {
         }
         lastScrollY = nil
 
-        // C. 클릭 제스처 처리 (약지+새끼 접기 vs 핀치)
+        // C. 좌클릭 / 드래그 판정
         let isPinchActive = (clickTriggerMode == .pinch || clickTriggerMode == .both)
         let isCurlActive = (clickTriggerMode == .fingerCurl || clickTriggerMode == .both)
 
-        let pinchEnter = isPinchActive && ((pinchRatio < pinchThresholdEnter) || (rawDist < pinchRawDistMax))
-        let curlEnter = isCurlActive && (curlRatio < curlThresholdEnter)
+        let pinchTriggered = isPinchActive && ((pinchRatio < pinchThresholdEnter) || (rawDist < pinchRawDistMax))
+        let curlTriggered = isCurlActive && (curlRatio < curlThresholdEnter)
+        let clickTriggered = pinchTriggered || curlTriggered
 
-        let isClickTriggered = pinchEnter || curlEnter
+        if !isPressed {
+            // 미누름 상태
+            if clickTriggered {
+                // 클릭 시작! (물리 마우스 좌클릭 누름 즉시 발동)
+                isPressed = true
+                isByCurl = curlTriggered
+                isDragging = false
+                pressStartTime = now
 
-        if !isPinching && !isFingerCurled {
-            // [모드별 접근 감속]: 핀치 모드일 때만 손가락 모음 감속 적용
-            var filteredTarget = rawTarget
-            if isPinchActive && pinchRatio < 0.58 {
-                let dampFactor = max(0.12, (pinchRatio - 0.38) / (0.58 - 0.38))
-                lock.lock()
-                let base = currentPoint ?? rawTarget
-                filteredTarget = CGPoint(x: base.x + (rawTarget.x - base.x) * dampFactor,
-                                         y: base.y + (rawTarget.y - base.y) * dampFactor)
-                lock.unlock()
-            }
-
-            if isClickTriggered {
-                // 클릭 트리거 발동!
-                let isByCurl = curlEnter
-
-                // 약지 접기인 경우 검지 끝이 전혀 흔들리지 않으므로 현재 target 사용
-                // 핀치인 경우 140ms 전 과거 롤백 위치 사용
+                // 앵커 좌표 결정
                 let anchor: CGPoint
                 if isByCurl {
                     anchor = rawTarget
                 } else {
                     let rollbackTime = now - 0.14
-                    anchor = history.last(where: { $0.t <= rollbackTime })?.p ?? history.first?.p ?? filteredTarget
+                    anchor = history.last(where: { $0.t <= rollbackTime })?.p ?? history.first?.p ?? rawTarget
                 }
-
-                if isByCurl {
-                    isFingerCurled = true
-                } else {
-                    isPinching = true
-                }
-
-                isDragging = false
-                isFrozen = true
-                clickStartTime = now
-                clickAnchorPoint = anchor
+                pressAnchorPoint = anchor
 
                 lock.lock()
                 targetPoint = anchor
                 currentPoint = anchor
                 lock.unlock()
 
+                // 커서 위치 고정 후 마우스 다운 즉시 전송!
                 CGWarpMouseCursorPosition(anchor)
-                postMouseMovedEvent(at: anchor, dx: 0, dy: 0)
+                postMouseDown(at: anchor)
 
                 let state: GestureState = isByCurl ? .fingerCurled : .pinching
-                let ratioToShow = isByCurl ? curlRatio : pinchRatio
-                updateState(state, point: anchor, ratio: ratioToShow)
+                let ratioVal = isByCurl ? curlRatio : pinchRatio
+                updateState(state, point: anchor, ratio: ratioVal)
             } else {
                 // 일반 이동: 240Hz 보간 스레드로 좌표 전달
                 lock.lock()
-                targetPoint = isPinchActive ? filteredTarget : rawTarget
+                targetPoint = rawTarget
                 lock.unlock()
                 updateState(.pointing, point: rawTarget, ratio: isCurlActive ? curlRatio : pinchRatio)
             }
         } else {
-            // 이미 클릭(다운) 유지 중인 상태
-            let isReleaseCondition: Bool
-            if isFingerCurled {
-                isReleaseCondition = curlRatio > curlThresholdExit
+            // 이미 마우스 누름(다운) 유지 중인 상태
+            let releaseCondition: Bool
+            if isByCurl {
+                releaseCondition = curlRatio > curlThresholdExit
             } else {
-                isReleaseCondition = (pinchRatio > pinchThresholdExit) && (rawDist > pinchRawDistMax * 1.25)
+                releaseCondition = (pinchRatio > pinchThresholdExit) && (rawDist > pinchRawDistMax * 1.25)
             }
 
-            let elapsed = now - clickStartTime
-            let moveDist = hypot(rawTarget.x - clickAnchorPoint.x, rawTarget.y - clickAnchorPoint.y)
+            let elapsed = now - pressStartTime
+            let moveDist = hypot(rawTarget.x - pressAnchorPoint.x, rawTarget.y - pressAnchorPoint.y)
 
-            if isReleaseCondition {
-                // 클릭 해제!
-                let wasCurled = isFingerCurled
-                isPinching = false
-                isFingerCurled = false
-                isFrozen = false
+            if releaseCondition {
+                // 클릭 뗌 (마우스 업 발동 -> 링크 열림/버튼 클릭 완료!)
+                isPressed = false
+                let wasDragging = isDragging
+                isDragging = false
 
-                if isDragging {
-                    // 드래그 종료
-                    postMouseEvent(.leftMouseUp, at: rawTarget, clicks: 1)
-                    isDragging = false
-                } else {
-                    // 순수 클릭 (탭): 앵커 포인트에 정확한 클릭 전송
-                    let clicks = nextClickCount(at: clickAnchorPoint, now: now)
-                    postMouseEvent(.leftMouseDown, at: clickAnchorPoint, clicks: clicks)
-                    postMouseEvent(.leftMouseUp, at: clickAnchorPoint, clicks: clicks)
-
-                    if !wasCurled {
-                        freezeUntilTime = now + 0.12
-                    }
-                }
+                let releasePoint = wasDragging ? rawTarget : pressAnchorPoint
+                postMouseUp(at: releasePoint)
 
                 lock.lock()
                 targetPoint = rawTarget
-                currentPoint = clickAnchorPoint
+                currentPoint = releasePoint
                 lock.unlock()
 
-                updateState(.pointing, point: clickAnchorPoint, ratio: wasCurled ? curlRatio : pinchRatio)
+                updateState(.pointing, point: releasePoint, ratio: isByCurl ? curlRatio : pinchRatio)
             } else {
-                // 클릭 유지 중: 손을 이동하거나 길게 유지하면 드래그로 전환
-                let dragDistanceThreshold: CGFloat = isFingerCurled ? 18.0 : 30.0
-                let dragTimeThreshold: CFAbsoluteTime = isFingerCurled ? 0.28 : 0.38
-
-                if !isDragging && (elapsed > dragTimeThreshold || moveDist > dragDistanceThreshold) {
+                // 누른 채 유지 중: 손을 25픽셀 이상 이동하거나 0.30초 이상 경과하면 드래그 모드로 진입
+                if !isDragging && (elapsed > 0.30 || moveDist > 25.0) {
                     isDragging = true
-                    isFrozen = false
-                    postMouseEvent(.leftMouseDown, at: clickAnchorPoint, clicks: 1)
                 }
 
                 if isDragging {
                     lock.lock()
                     targetPoint = rawTarget
                     lock.unlock()
-                    updateState(.dragging, point: rawTarget, ratio: isFingerCurled ? curlRatio : pinchRatio)
+                    updateState(.dragging, point: rawTarget, ratio: isByCurl ? curlRatio : pinchRatio)
                 } else {
-                    updateState(isFingerCurled ? .fingerCurled : .pinching, point: clickAnchorPoint, ratio: isFingerCurled ? curlRatio : pinchRatio)
+                    updateState(isByCurl ? .fingerCurled : .pinching, point: pressAnchorPoint, ratio: isByCurl ? curlRatio : pinchRatio)
                 }
             }
         }
     }
 
-    private func nextClickCount(at p: CGPoint, now: CFAbsoluteTime) -> Int {
-        if now - lastClickTime < 0.40 && hypot(p.x - lastClickPoint.x, p.y - lastClickPoint.y) < 20 {
-            clickCount = min(clickCount + 1, 3)
-        } else {
-            clickCount = 1
-        }
-        lastClickTime = now
-        lastClickPoint = p
-        return clickCount
+    // MARK: - Mouse Event Injections (시스템 호환: mouseEventSource: nil)
+
+    private func postMouseDown(at point: CGPoint) {
+        guard let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left) else { return }
+        ev.setIntegerValueField(.mouseEventClickState, value: 1)
+        ev.post(tap: .cghidEventTap)
+    }
+
+    private func postMouseUp(at point: CGPoint) {
+        guard let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else { return }
+        ev.setIntegerValueField(.mouseEventClickState, value: 1)
+        ev.post(tap: .cghidEventTap)
+    }
+
+    private func postMouseDragged(at point: CGPoint, dx: CGFloat, dy: CGFloat) {
+        guard let ev = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: point, mouseButton: .left) else { return }
+        ev.setDoubleValueField(.mouseEventDeltaX, value: Double(dx))
+        ev.setDoubleValueField(.mouseEventDeltaY, value: Double(dy))
+        ev.post(tap: .cghidEventTap)
+    }
+
+    private func postMouseMoved(at point: CGPoint, dx: CGFloat, dy: CGFloat) {
+        guard let ev = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else { return }
+        ev.setDoubleValueField(.mouseEventDeltaX, value: Double(dx))
+        ev.setDoubleValueField(.mouseEventDeltaY, value: Double(dy))
+        ev.post(tap: .cghidEventTap)
     }
 
     private func triggerRightClick(at point: CGPoint) {
-        postMouseEvent(.rightMouseDown, at: point, button: .right)
-        postMouseEvent(.rightMouseUp, at: point, button: .right)
+        if let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: point, mouseButton: .right) {
+            down.post(tap: .cghidEventTap)
+        }
+        usleep(30_000)
+        if let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: point, mouseButton: .right) {
+            up.post(tap: .cghidEventTap)
+        }
     }
 
-    private func scroll(dy: Double) {
-        let ev = CGEvent(scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 1,
-                         wheel1: Int32(dy.rounded()), wheel2: 0, wheel3: 0)
+    private func scroll(lines: Int32) {
+        // macOS 웹 브라우저(Safari, Chrome)에서 완벽히 작동하는 라인 단위 휠 스크롤
+        let ev = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1,
+                         wheel1: lines, wheel2: 0, wheel3: 0)
         ev?.post(tap: .cghidEventTap)
     }
 
-    private func postMouseMovedEvent(at point: CGPoint, dx: CGFloat, dy: CGFloat) {
-        guard let ev = CGEvent(mouseEventSource: eventSource, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else { return }
-        ev.setDoubleValueField(.mouseEventDeltaX, value: Double(dx))
-        ev.setDoubleValueField(.mouseEventDeltaY, value: Double(dy))
-        ev.post(tap: .cghidEventTap)
-    }
-
-    private func postMouseDraggedEvent(at point: CGPoint, dx: CGFloat, dy: CGFloat) {
-        guard let ev = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseDragged, mouseCursorPosition: point, mouseButton: .left) else { return }
-        ev.setDoubleValueField(.mouseEventDeltaX, value: Double(dx))
-        ev.setDoubleValueField(.mouseEventDeltaY, value: Double(dy))
-        ev.post(tap: .cghidEventTap)
-    }
-
     private func releaseMouse() {
-        if isPinching || isFingerCurled {
-            isPinching = false
-            isFingerCurled = false
-            isFrozen = false
-            if isDragging {
-                isDragging = false
-                postMouseEvent(.leftMouseUp, at: lastCursorPoint, clicks: 1)
-            }
+        if isPressed {
+            isPressed = false
+            let p = isDragging ? lastCursorPoint : pressAnchorPoint
+            isDragging = false
+            postMouseUp(at: p)
         }
     }
 
@@ -472,19 +429,11 @@ final class GestureEngine {
         currentPoint = nil
         isMoving = false
         hasSentSettledEvent = false
-        isFrozen = false
-        freezeUntilTime = 0.0
         lock.unlock()
         history.removeAll()
         filterX.reset()
         filterY.reset()
         lastScrollY = nil
-    }
-
-    private func postMouseEvent(_ type: CGEventType, at point: CGPoint, button: CGMouseButton = .left, clicks: Int = 1) {
-        guard let ev = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { return }
-        ev.setIntegerValueField(.mouseEventClickState, value: Int64(clicks))
-        ev.post(tap: .cghidEventTap)
     }
 
     private func updateState(_ state: GestureState, point: CGPoint, ratio: CGFloat?) {
