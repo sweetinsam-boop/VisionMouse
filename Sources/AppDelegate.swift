@@ -83,20 +83,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         menu.addItem(hudMenuItem)
 
         let sensitivityMenu = NSMenu()
-        let sensNormal = NSMenuItem(title: "보통 (권장)", action: #selector(setSensNormal), keyEquivalent: "")
-        sensNormal.target = self
-        sensNormal.state = .on
-        sensitivityMenu.addItem(sensNormal)
-
-        let sensHigh = NSMenuItem(title: "고감도 (작은 손 움직임)", action: #selector(setSensHigh), keyEquivalent: "")
-        sensHigh.target = self
-        sensitivityMenu.addItem(sensHigh)
-
-        let sensLow = NSMenuItem(title: "저감도 (정밀)", action: #selector(setSensLow), keyEquivalent: "")
-        sensLow.target = self
-        sensitivityMenu.addItem(sensLow)
-
-        let sensItem = NSMenuItem(title: "포인터 감도", action: nil, keyEquivalent: "")
+        for level in SensitivityLevel.allCases {
+            let it = NSMenuItem(title: level.rawValue, action: #selector(setSensitivityLevel(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = level
+            it.state = (gestureEngine.sensitivity == level) ? .on : .off
+            sensitivityMenu.addItem(it)
+        }
+        let currentSensTitle = gestureEngine.sensitivity.rawValue.components(separatedBy: " ").first ?? ""
+        let sensItem = NSMenuItem(title: "포인터 감도 (\(currentSensTitle))", action: nil, keyEquivalent: "")
         sensItem.submenu = sensitivityMenu
         menu.addItem(sensItem)
 
@@ -207,28 +202,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         buildMenu()
     }
 
-    @objc private func setSensNormal() {
-        gestureEngine.roiMinX = 0.20
-        gestureEngine.roiMaxX = 0.80
-        gestureEngine.roiMinY = 0.20
-        gestureEngine.roiMaxY = 0.80
-        buildMenu()
-    }
-
-    @objc private func setSensHigh() {
-        gestureEngine.roiMinX = 0.30
-        gestureEngine.roiMaxX = 0.70
-        gestureEngine.roiMinY = 0.30
-        gestureEngine.roiMaxY = 0.70
-        buildMenu()
-    }
-
-    @objc private func setSensLow() {
-        gestureEngine.roiMinX = 0.10
-        gestureEngine.roiMaxX = 0.90
-        gestureEngine.roiMinY = 0.10
-        gestureEngine.roiMaxY = 0.90
-        buildMenu()
+    @objc private func setSensitivityLevel(_ sender: NSMenuItem) {
+        if let level = sender.representedObject as? SensitivityLevel {
+            gestureEngine.sensitivity = level
+            buildMenu()
+        }
     }
 
     @objc private func quitApp() {

@@ -8,6 +8,13 @@ enum ClickTriggerMode: String, CaseIterable {
     case both = "둘 다 허용 (약지 접기 or 핀치)"
 }
 
+enum SensitivityLevel: String, CaseIterable {
+    case veryHigh = "초고감도 (손가락만 살짝)"
+    case high = "고감도 (작은 손 움직임)"
+    case normal = "보통 (권장)"
+    case low = "저감도 (넓게 정밀 조작)"
+}
+
 enum GestureState: String {
     case idle = "대기 중"
     case pointing = "포인팅"
@@ -29,11 +36,39 @@ final class GestureEngine {
     // 클릭 방식 설정 (기본: 약지+새끼 접기)
     var clickTriggerMode: ClickTriggerMode = .fingerCurl
 
+    // 포인터 감도 설정 (기본: 보통)
+    var sensitivity: SensitivityLevel = .normal {
+        didSet {
+            applySensitivity(sensitivity)
+        }
+    }
+
     // ROI (손의 유효 활동 영역)
     var roiMinX: CGFloat = 0.20
     var roiMaxX: CGFloat = 0.80
     var roiMinY: CGFloat = 0.20
     var roiMaxY: CGFloat = 0.80
+
+    private func applySensitivity(_ level: SensitivityLevel) {
+        switch level {
+        case .veryHigh:
+            roiMinX = 0.36; roiMaxX = 0.64
+            roiMinY = 0.36; roiMaxY = 0.64
+            filterX.beta = 0.050; filterY.beta = 0.050
+        case .high:
+            roiMinX = 0.28; roiMaxX = 0.72
+            roiMinY = 0.28; roiMaxY = 0.72
+            filterX.beta = 0.040; filterY.beta = 0.040
+        case .normal:
+            roiMinX = 0.20; roiMaxX = 0.80
+            roiMinY = 0.20; roiMaxY = 0.80
+            filterX.beta = 0.035; filterY.beta = 0.035
+        case .low:
+            roiMinX = 0.10; roiMaxX = 0.90
+            roiMinY = 0.10; roiMaxY = 0.90
+            filterX.beta = 0.020; filterY.beta = 0.020
+        }
+    }
 
     // 핀치 임계값
     var pinchThresholdEnter: CGFloat = 0.38
