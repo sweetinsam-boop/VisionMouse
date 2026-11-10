@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SIGN_ID="${SIGN_ID:-Apple Development: sweetinsam@naver.com (A23S2DQAVM)}" ./build.sh
+SIGN_ID="${SIGN_ID:--}" ./build.sh
 
 echo "==> Running VisionMouse.app..."
 pkill -x VisionMouse 2>/dev/null || true

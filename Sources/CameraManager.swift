@@ -11,7 +11,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     private let session = AVCaptureSession()
     private let output = AVCaptureVideoDataOutput()
-    private let sessionQueue = DispatchQueue(label: "com.song.VisionMouse.camera", qos: .userInteractive)
+    private let sessionQueue = DispatchQueue(label: "com.aimmac.VisionMouse.camera", qos: .userInteractive)
     private var isConfigured = false
     private var currentDevice: AVCaptureDevice?
 

@@ -64,9 +64,16 @@ final class HUDView: NSView {
             fpsLabel.stringValue = String(format: "%.0f FPS", fps)
         }
 
-        statusLabel.stringValue = state.rawValue
+        let ratioStr: String
+        if let ratio = hand?.pinchRatio {
+            ratioStr = String(format: " · 핀치:%.2f", ratio)
+        } else {
+            ratioStr = ""
+        }
+
+        statusLabel.stringValue = state.rawValue + ratioStr
         switch state {
-        case .pinching:
+        case .pinching, .dragging:
             statusLabel.textColor = .systemGreen
         case .rightClicking:
             statusLabel.textColor = .systemOrange

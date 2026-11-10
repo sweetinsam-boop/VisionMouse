@@ -23,14 +23,27 @@ struct HandPoseData {
     var wrist: CGPoint? { points[.wrist] }
 
     var isValid: Bool {
-        indexTip != nil && thumbTip != nil && wrist != nil
+        // 손목이 화각 밖으로 나가더라도 손가락 관절들이 보이면 유효한 손으로 판정
+        indexTip != nil && thumbTip != nil && (wrist != nil || indexMCP != nil || thumbMP != nil)
     }
 
-    /// 손바닥 기준 척도 (검지 관절과 손목 간 거리)
+    /// 손바닥 기준 척도 (거리 변화에 강건한 정규화 척도)
     var palmScale: CGFloat {
-        guard let mcp = indexMCP, let w = wrist else { return 0.2 }
-        let d = hypot(mcp.x - w.x, mcp.y - w.y)
-        return max(d, 0.05)
+        if let mcp = indexMCP, let w = wrist {
+            let d = hypot(mcp.x - w.x, mcp.y - w.y)
+            return max(d, 0.06)
+        }
+        // 손목이 잘린 경우: 검지 마디(MCP-PIP) 거리 기반 추정
+        if let mcp = indexMCP, let pip = indexPIP {
+            let d = hypot(mcp.x - pip.x, mcp.y - pip.y) * 2.3
+            return max(d, 0.06)
+        }
+        // 엄지-중지 관절 기준 대체
+        if let tmp = thumbMP, let mcp = indexMCP {
+            let d = hypot(tmp.x - mcp.x, tmp.y - mcp.y) * 1.8
+            return max(d, 0.06)
+        }
+        return 0.18
     }
 
     /// 엄지와 검지 사이의 정규화된 거리 비율
@@ -72,7 +85,7 @@ final class HandPoseDetector {
     weak var delegate: HandPoseDetectorDelegate?
 
     private let handPoseRequest: VNDetectHumanHandPoseRequest
-    private let confidenceThreshold: Float = 0.35
+    private let confidenceThreshold: Float = 0.25
 
     init() {
         handPoseRequest = VNDetectHumanHandPoseRequest()

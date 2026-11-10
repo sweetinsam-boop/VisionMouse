@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.song.VisionMouse</string>
+    <string>com.aimmac.VisionMouse</string>
     <key>CFBundleName</key>
     <string>VisionMouse</string>
     <key>CFBundleDisplayName</key>
