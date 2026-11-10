@@ -1,6 +1,7 @@
 import AppKit
 import CoreMedia
 import ApplicationServices
+import AVFoundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate, HandPoseDetectorDelegate, GestureEngineDelegate {
     private var statusItem: NSStatusItem!
@@ -42,10 +43,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     private func buildMenu() {
         let menu = NSMenu()
 
-        let statusTitle = isPaused ? "상태: ⏸️ 일시정지됨" : "상태: 🟢 작동 중"
+        let statusTitle = isPaused ? "상태: ⏸️ 일시정지됨" : "상태: 🟢 작동 중 (240Hz 보간)"
         let statusMenuItem = NSMenuItem(title: statusTitle, action: #selector(togglePause), keyEquivalent: "")
         statusMenuItem.target = self
         menu.addItem(statusMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // 1. 카메라 선택 서브메뉴
+        let camMenu = NSMenu()
+        let devices = cameraManager.availableDevices()
+        for dev in devices {
+            var label = dev.localizedName
+            if dev.localizedName.contains("iPhone") {
+                label += " (⚡ 60 FPS 초고속 지원)"
+            } else {
+                label += " (30 FPS 고정)"
+            }
+            let it = NSMenuItem(title: label, action: #selector(selectCameraDevice(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = dev.uniqueID
+            it.state = (dev.localizedName == cameraManager.currentDeviceName) ? .on : .off
+            camMenu.addItem(it)
+        }
+        let camItem = NSMenuItem(title: "카메라 선택 (\(cameraManager.currentDeviceName))", action: nil, keyEquivalent: "")
+        camItem.submenu = camMenu
+        menu.addItem(camItem)
+
+        // 2. 초저지연 반응 모드
+        let lowLatencyItem = NSMenuItem(title: "⚡ 초저지연 모드 (640x480 ANE 가속)", action: #selector(toggleLowLatency), keyEquivalent: "")
+        lowLatencyItem.target = self
+        lowLatencyItem.state = cameraManager.isLowLatencyMode ? .on : .off
+        menu.addItem(lowLatencyItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -121,6 +150,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
 
     // MARK: - Actions
 
+    @objc private func selectCameraDevice(_ sender: NSMenuItem) {
+        if let uid = sender.representedObject as? String {
+            cameraManager.switchDevice(uniqueID: uid)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.buildMenu()
+            }
+        }
+    }
+
+    @objc private func toggleLowLatency() {
+        cameraManager.setLowLatencyMode(!cameraManager.isLowLatencyMode)
+        buildMenu()
+    }
+
     @objc private func togglePause() {
         isPaused.toggle()
         gestureEngine.isEnabled = !isPaused
@@ -180,13 +223,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     func handPoseDetector(_ detector: HandPoseDetector, didDetect hand: HandPoseData?, frame: CVImageBuffer) {
         gestureEngine.process(hand: hand)
         if isHUDVisible {
-            hud?.update(frame: frame, hand: hand, state: gestureEngine.currentState)
+            hud?.renderFrame(buffer: frame, hand: hand, state: gestureEngine.currentState)
         }
     }
 
     // MARK: - GestureEngineDelegate
 
     func gestureEngine(_ engine: GestureEngine, didChangeState state: GestureState, point: CGPoint, pinchRatio: CGFloat?) {
-        // 제스처 상태 변화 시 추가 처리 필요시 사용
     }
 }

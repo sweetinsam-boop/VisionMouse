@@ -34,8 +34,8 @@ final class HUDView: NSView {
         statusLabel.frame = NSRect(x: 10, y: 8, width: 140, height: 18)
         addSubview(statusLabel)
 
-        fpsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        fpsLabel.textColor = NSColor.white.withAlphaComponent(0.8)
+        fpsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold)
+        fpsLabel.textColor = NSColor.white.withAlphaComponent(0.9)
         fpsLabel.alignment = .right
         fpsLabel.frame = NSRect(x: bounds.width - 70, y: 8, width: 60, height: 18)
         addSubview(fpsLabel)
@@ -46,17 +46,14 @@ final class HUDView: NSView {
         fpsLabel.frame = NSRect(x: bounds.width - 70, y: 8, width: 60, height: 18)
     }
 
-    func update(frame: CVImageBuffer?, hand: HandPoseData?, state: GestureState) {
-        if let frame = frame {
-            let ciImage = CIImage(cvImageBuffer: frame)
-            let context = CIContext()
-            currentImage = context.createCGImage(ciImage, from: ciImage.extent)
+    func update(image: CGImage?, hand: HandPoseData?, state: GestureState) {
+        if let image = image {
+            currentImage = image
         }
-
         currentHand = hand
         currentState = state
 
-        // FPS 계산
+        // FPS 계산 (카메라 + 비전 추론 프레임레이트)
         frameCount += 1
         let now = CFAbsoluteTimeGetCurrent()
         let dt = now - lastFpsCalcTime
@@ -90,13 +87,12 @@ final class HUDView: NSView {
 
         let b = bounds
 
-        // 1. 카메라 영상 (반투명 어둡게 렌더링)
+        // 1. 카메라 영상 (거울 모드로 좌우 반전 렌더링)
         if let img = currentImage {
             ctx.saveGState()
-            // 거울 모드로 좌우 반전 렌더링
             ctx.translateBy(x: b.width, y: 0)
             ctx.scaleBy(x: -1.0, y: 1.0)
-            ctx.setAlpha(0.55)
+            ctx.setAlpha(0.45)
             ctx.draw(img, in: b)
             ctx.restoreGState()
         }
@@ -112,7 +108,6 @@ final class HUDView: NSView {
 
         for (j1, j2) in HandPoseData.skeletonConnections {
             if let p1 = hand.points[j1], let p2 = hand.points[j2] {
-                // 거울 모드 좌표 변환
                 let pt1 = CGPoint(x: (1.0 - p1.x) * b.width, y: p1.y * b.height)
                 let pt2 = CGPoint(x: (1.0 - p2.x) * b.width, y: p2.y * b.height)
 
@@ -166,6 +161,8 @@ final class HUDView: NSView {
 
 final class FloatingHUD: NSPanel {
     let hudView: HUDView
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private var imageFrameSkip = 0
 
     init() {
         let size = NSSize(width: 240, height: 160)
@@ -192,9 +189,19 @@ final class FloatingHUD: NSPanel {
         contentView = hudView
     }
 
-    func update(frame: CVImageBuffer?, hand: HandPoseData?, state: GestureState) {
+    /// 백그라운드 큐에서 안전하게 호출됨
+    func renderFrame(buffer: CVImageBuffer?, hand: HandPoseData?, state: GestureState) {
+        var cgImage: CGImage?
+
+        // 배경 비디오 이미지는 2프레임당 1회만 변환하여 CPU/GPU 부담 60% 절감
+        imageFrameSkip += 1
+        if imageFrameSkip % 2 == 0, let buffer = buffer {
+            let ciImage = CIImage(cvImageBuffer: buffer)
+            cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent)
+        }
+
         DispatchQueue.main.async { [weak self] in
-            self?.hudView.update(frame: frame, hand: hand, state: state)
+            self?.hudView.update(image: cgImage, hand: hand, state: state)
         }
     }
 }

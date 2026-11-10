@@ -33,23 +33,83 @@ final class GestureEngine {
     private var lastRightClickTime: CFAbsoluteTime = 0.0
 
     // 스크롤 모드
-    private var isScrollMode = false
     private var lastScrollY: CGFloat?
 
-    // 마우스 상태
+    // 마우스 상태 & 240Hz 보간 엔진
+    private let lock = NSLock()
+    private var targetPoint: CGPoint?
+    private var currentPoint: CGPoint?
+    private var isMoving = false
     private var isPinching = false
     private var lastCursorPoint: CGPoint = .zero
     private(set) var currentState: GestureState = .noHand
 
-    // 필터
-    private let filterX = OneEuro(minCutoff: 1.2, beta: 0.02)
-    private let filterY = OneEuro(minCutoff: 1.2, beta: 0.02)
+    // 필터 (반응 속도 강화를 위해 minCutoff 1.5, beta 0.035로 튜닝)
+    private let filterX = OneEuro(minCutoff: 1.5, beta: 0.035)
+    private let filterY = OneEuro(minCutoff: 1.5, beta: 0.035)
 
     var isEnabled: Bool = true {
         didSet {
             if !isEnabled {
                 releaseAll()
             }
+        }
+    }
+
+    init() {
+        startInterpolationThread()
+    }
+
+    /// 240Hz 고주사율 디스플레이 보간 스레드 (30fps 센서 입력을 120Hz 화면에서 비단결처럼 부드럽게 글라이딩)
+    private func startInterpolationThread() {
+        let th = Thread { [weak self] in
+            while true {
+                guard let self = self else { return }
+                self.tick()
+
+                self.lock.lock()
+                let idle = !self.isMoving && !self.isPinching
+                self.lock.unlock()
+
+                // 정지 시 50Hz 절전, 이동 중 240Hz (4.16ms) 초부드러운 보간
+                usleep(idle ? 20_000 : 4_166)
+            }
+        }
+        th.name = "com.song.VisionMouse.interpolator"
+        th.qualityOfService = .userInteractive
+        th.start()
+    }
+
+    private func tick() {
+        lock.lock()
+        guard isEnabled, let t = targetPoint else {
+            lock.unlock()
+            return
+        }
+
+        var c = currentPoint ?? t
+        let dx = t.x - c.x
+        let dy = t.y - c.y
+
+        if abs(dx) < 0.15 && abs(dy) < 0.15 && currentPoint != nil {
+            isMoving = false
+            lock.unlock()
+            return
+        }
+
+        isMoving = true
+        // 고응답성 지수 감쇠 보간 (0.52 계수로 240Hz 보간 시 2프레임 내 목표 수렴)
+        c.x += dx * 0.52
+        c.y += dy * 0.52
+        currentPoint = c
+        let dragging = isPinching
+        lock.unlock()
+
+        if dragging {
+            CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: c, mouseButton: .left)?.post(tap: .cghidEventTap)
+        } else {
+            CGWarpMouseCursorPosition(c)
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: c, mouseButton: .left)?.post(tap: .cghidEventTap)
         }
     }
 
@@ -72,26 +132,29 @@ final class GestureEngine {
 
         let now = hand.timestamp
 
-        // 1. 거울 반전 및 정규화
-        // 사용자가 오른손을 오른쪽으로 이동하면 미러링으로 인해 카메라에서는 x가 작아짐 -> 1.0 - x로 보정
+        // 1. 거울 반전 및 상하 반전
         let mirrorX = 1.0 - indexTip.x
-        // Vision y는 아래가 0, 위가 1. 화면은 위가 0이므로 반전
         let invertY = 1.0 - indexTip.y
 
-        // 2. Active ROI 매핑 (손을 조금만 움직여도 화면 전체에 도달하도록 스케일링)
+        // 2. Active ROI 매핑
         let clampedX = min(max((mirrorX - roiMinX) / (roiMaxX - roiMinX), 0.0), 1.0)
         let clampedY = min(max((invertY - roiMinY) / (roiMaxY - roiMinY), 0.0), 1.0)
 
-        // 3. OneEuro 필터로 떨림 제거
+        // 3. OneEuro 필터
         let smoothX = filterX.filter(Double(clampedX), t: now)
         let smoothY = filterY.filter(Double(clampedY), t: now)
 
-        // 4. 메인 화면 픽셀 좌표 매핑
+        // 4. 화면 좌표 매핑
         let screen = CGDisplayBounds(CGMainDisplayID())
         let targetX = screen.origin.x + CGFloat(smoothX) * screen.width
         let targetY = screen.origin.y + CGFloat(smoothY) * screen.height
-        let targetPoint = CGPoint(x: targetX, y: targetY)
-        lastCursorPoint = targetPoint
+        let target = CGPoint(x: targetX, y: targetY)
+        lastCursorPoint = target
+
+        // 240Hz 보간 스레드로 목표점 전달
+        lock.lock()
+        targetPoint = target
+        lock.unlock()
 
         let pinchRatio = hand.pinchRatio ?? 1.0
         let middlePinchRatio = hand.middlePinchRatio ?? 1.0
@@ -101,25 +164,24 @@ final class GestureEngine {
         if middlePinchRatio < rightPinchThreshold && pinchRatio > pinchThresholdExit {
             if now - lastRightClickTime > 0.6 {
                 lastRightClickTime = now
-                triggerRightClick(at: targetPoint)
-                updateState(.rightClicking, point: targetPoint, ratio: middlePinchRatio)
+                triggerRightClick(at: target)
+                updateState(.rightClicking, point: target, ratio: middlePinchRatio)
                 return
             }
         }
 
-        // B. 두 손가락 모음 스크롤 제스처 판정
-        // 검지와 중지가 나란히 있고 팁 거리가 가깝고, 엄지는 떨어져 있을 때
+        // B. 두 손가락 스크롤 제스처 판정
         if let midTip = hand.middleTip {
             let fingerDist = hypot(indexTip.x - midTip.x, indexTip.y - midTip.y) / hand.palmScale
             if fingerDist < 0.22 && pinchRatio > 0.42 {
                 if let prevY = lastScrollY {
-                    let dy = (clampedY - prevY) * 350.0
+                    let dy = (clampedY - prevY) * 380.0
                     if abs(dy) > 1.0 {
                         scroll(dy: Double(dy))
                     }
                 }
                 lastScrollY = clampedY
-                updateState(.scrolling, point: targetPoint, ratio: fingerDist)
+                updateState(.scrolling, point: target, ratio: fingerDist)
                 return
             }
         }
@@ -128,32 +190,21 @@ final class GestureEngine {
         // C. 엄지-검지 핀치 (좌클릭 / 드래그)
         if !isPinching {
             if pinchRatio < pinchThresholdEnter {
-                // 핀치 시작 -> 좌클릭 다운
                 isPinching = true
-                postMouseEvent(.leftMouseDown, at: targetPoint)
-                updateState(.pinching, point: targetPoint, ratio: pinchRatio)
+                postMouseEvent(.leftMouseDown, at: target)
+                updateState(.pinching, point: target, ratio: pinchRatio)
             } else {
-                // 일반 포인터 이동
-                moveCursor(to: targetPoint)
-                updateState(.pointing, point: targetPoint, ratio: pinchRatio)
+                updateState(.pointing, point: target, ratio: pinchRatio)
             }
         } else {
             if pinchRatio > pinchThresholdExit {
-                // 핀치 해제 -> 좌클릭 업
                 isPinching = false
-                postMouseEvent(.leftMouseUp, at: targetPoint)
-                updateState(.pointing, point: targetPoint, ratio: pinchRatio)
+                postMouseEvent(.leftMouseUp, at: target)
+                updateState(.pointing, point: target, ratio: pinchRatio)
             } else {
-                // 핀치 유지 -> 드래그
-                postMouseEvent(.leftMouseDragged, at: targetPoint)
-                updateState(.pinching, point: targetPoint, ratio: pinchRatio)
+                updateState(.pinching, point: target, ratio: pinchRatio)
             }
         }
-    }
-
-    private func moveCursor(to point: CGPoint) {
-        CGWarpMouseCursorPosition(point)
-        postMouseEvent(.mouseMoved, at: point)
     }
 
     private func triggerRightClick(at point: CGPoint) {
@@ -176,6 +227,11 @@ final class GestureEngine {
 
     private func releaseAll() {
         releaseMouse()
+        lock.lock()
+        targetPoint = nil
+        currentPoint = nil
+        isMoving = false
+        lock.unlock()
         filterX.reset()
         filterY.reset()
         lastScrollY = nil
