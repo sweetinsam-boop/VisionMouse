@@ -19,7 +19,10 @@ struct HandPoseData {
     var middleMCP: CGPoint? { points[.middleMCP] }
 
     var ringTip: CGPoint? { points[.ringTip] }
+    var ringMCP: CGPoint? { points[.ringMCP] }
+
     var littleTip: CGPoint? { points[.littleTip] }
+    var littleMCP: CGPoint? { points[.littleMCP] }
     var wrist: CGPoint? { points[.wrist] }
 
     var isValid: Bool {
@@ -58,6 +61,26 @@ struct HandPoseData {
         guard let mid = middleTip, let thm = thumbTip else { return nil }
         let dist = hypot(mid.x - thm.x, mid.y - thm.y)
         return dist / palmScale
+    }
+
+    /// 약지와 새끼손가락의 접힘 비율 (0.0: 완전 접힘, 1.0+: 완전 펼침)
+    var lowerFingerCurlRatio: CGFloat {
+        var ratios: [CGFloat] = []
+        if let tip = ringTip, let mcp = ringMCP {
+            let d = hypot(tip.x - mcp.x, tip.y - mcp.y)
+            ratios.append(d / palmScale)
+        }
+        if let tip = littleTip, let mcp = littleMCP {
+            let d = hypot(tip.x - mcp.x, tip.y - mcp.y)
+            ratios.append(d / palmScale)
+        }
+        guard !ratios.isEmpty else { return 1.0 }
+        return ratios.reduce(0, +) / CGFloat(ratios.count)
+    }
+
+    /// 약지 또는 새끼손가락이 접혔는지 여부
+    var isLowerFingersCurled: Bool {
+        lowerFingerCurlRatio < 0.60
     }
 
     /// 스켈레톤 연결선 쌍 (오버레이 드로잉용)

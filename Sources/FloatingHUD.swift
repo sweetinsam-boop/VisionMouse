@@ -65,7 +65,9 @@ final class HUDView: NSView {
         }
 
         let ratioStr: String
-        if let ratio = hand?.pinchRatio {
+        if state == .fingerCurled {
+            ratioStr = String(format: " · 접힘:%.2f", hand?.lowerFingerCurlRatio ?? 0.0)
+        } else if let ratio = hand?.pinchRatio {
             ratioStr = String(format: " · 핀치:%.2f", ratio)
         } else {
             ratioStr = ""
@@ -73,7 +75,7 @@ final class HUDView: NSView {
 
         statusLabel.stringValue = state.rawValue + ratioStr
         switch state {
-        case .pinching, .dragging:
+        case .pinching, .fingerCurled, .dragging:
             statusLabel.textColor = .systemGreen
         case .rightClicking:
             statusLabel.textColor = .systemOrange
@@ -133,11 +135,13 @@ final class HUDView: NSView {
             let rect = CGRect(x: drawPt.x - radius, y: drawPt.y - radius, width: radius * 2, height: radius * 2)
 
             if joint == .indexTip {
-                ctx.setFillColor(currentState == .pinching ? NSColor.systemGreen.cgColor : NSColor.systemCyan.cgColor)
+                ctx.setFillColor((currentState == .pinching || currentState == .fingerCurled) ? NSColor.systemGreen.cgColor : NSColor.systemCyan.cgColor)
             } else if joint == .thumbTip {
                 ctx.setFillColor(currentState == .pinching ? NSColor.systemGreen.cgColor : NSColor.systemYellow.cgColor)
             } else if joint == .middleTip {
                 ctx.setFillColor(currentState == .rightClicking ? NSColor.systemOrange.cgColor : NSColor.white.cgColor)
+            } else if joint == .ringTip || joint == .littleTip {
+                ctx.setFillColor(currentState == .fingerCurled ? NSColor.systemGreen.cgColor : NSColor.white.withAlphaComponent(0.8).cgColor)
             } else {
                 ctx.setFillColor(NSColor.white.withAlphaComponent(0.8).cgColor)
             }
@@ -193,6 +197,7 @@ final class FloatingHUD: NSPanel {
         backgroundColor = .clear
         isOpaque = false
         hasShadow = true
+        ignoresMouseEvents = false
         contentView = hudView
     }
 

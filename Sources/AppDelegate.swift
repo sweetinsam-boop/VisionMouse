@@ -100,23 +100,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         sensItem.submenu = sensitivityMenu
         menu.addItem(sensItem)
 
+        // 3. 클릭 방식 선택 (약지+새끼 접기 vs 핀치)
+        let clickMenu = NSMenu()
+        for mode in ClickTriggerMode.allCases {
+            let it = NSMenuItem(title: mode.rawValue, action: #selector(setClickTriggerMode(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = mode
+            it.state = (gestureEngine.clickTriggerMode == mode) ? .on : .off
+            clickMenu.addItem(it)
+        }
+        let clickItem = NSMenuItem(title: "클릭 제스처 방식", action: nil, keyEquivalent: "")
+        clickItem.submenu = clickMenu
+        menu.addItem(clickItem)
+
         menu.addItem(NSMenuItem.separator())
 
-        let tip1 = NSMenuItem(title: "💡 검지 이동: 마우스 커서 이동", action: nil, keyEquivalent: "")
+        let tip1 = NSMenuItem(title: "💡 검지 이동: 마우스 커서 조준", action: nil, keyEquivalent: "")
         tip1.isEnabled = false
         menu.addItem(tip1)
 
-        let tip2 = NSMenuItem(title: "💡 엄지+검지 핀치: 좌클릭 / 드래그", action: nil, keyEquivalent: "")
+        let tip2 = NSMenuItem(title: "💡 약지+새끼 접기: 흔들림 없는 좌클릭 / 드래그", action: nil, keyEquivalent: "")
         tip2.isEnabled = false
         menu.addItem(tip2)
 
-        let tip3 = NSMenuItem(title: "💡 엄지+중지 핀치: 우클릭", action: nil, keyEquivalent: "")
+        let tip3 = NSMenuItem(title: "💡 엄지+검지 핀치: 보조 좌클릭", action: nil, keyEquivalent: "")
         tip3.isEnabled = false
         menu.addItem(tip3)
 
-        let tip4 = NSMenuItem(title: "💡 검지+중지 모아 상하: 스크롤", action: nil, keyEquivalent: "")
+        let tip4 = NSMenuItem(title: "💡 엄지+중지 핀치: 우클릭", action: nil, keyEquivalent: "")
         tip4.isEnabled = false
         menu.addItem(tip4)
+
+        let tip5 = NSMenuItem(title: "💡 검지+중지 모아 상하: 스크롤", action: nil, keyEquivalent: "")
+        tip5.isEnabled = false
+        menu.addItem(tip5)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -162,6 +179,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     @objc private func toggleLowLatency() {
         cameraManager.setLowLatencyMode(!cameraManager.isLowLatencyMode)
         buildMenu()
+    }
+
+    @objc private func setClickTriggerMode(_ sender: NSMenuItem) {
+        if let mode = sender.representedObject as? ClickTriggerMode {
+            gestureEngine.clickTriggerMode = mode
+            buildMenu()
+        }
     }
 
     @objc private func togglePause() {
