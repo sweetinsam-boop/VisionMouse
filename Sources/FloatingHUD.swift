@@ -1,11 +1,13 @@
 import AppKit
 import Vision
 import CoreMedia
+import ApplicationServices
 
 final class HUDView: NSView {
     private var currentImage: CGImage?
     private var currentHand: HandPoseData?
     private var currentState: GestureState = .noHand
+    private var roiRect: CGRect = CGRect(x: 0.20, y: 0.20, width: 0.60, height: 0.60)
     private var fps: Double = 0.0
     private var frameCount = 0
     private var lastFpsCalcTime = CFAbsoluteTimeGetCurrent()
@@ -31,27 +33,28 @@ final class HUDView: NSView {
 
         statusLabel.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         statusLabel.textColor = .white
-        statusLabel.frame = NSRect(x: 10, y: 8, width: 140, height: 18)
+        statusLabel.frame = NSRect(x: 10, y: 8, width: 165, height: 18)
         addSubview(statusLabel)
 
         fpsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold)
         fpsLabel.textColor = NSColor.white.withAlphaComponent(0.9)
         fpsLabel.alignment = .right
-        fpsLabel.frame = NSRect(x: bounds.width - 70, y: 8, width: 60, height: 18)
+        fpsLabel.frame = NSRect(x: bounds.width - 65, y: 8, width: 55, height: 18)
         addSubview(fpsLabel)
     }
 
     override func resizeSubviews(withOldSize oldSize: NSSize) {
         super.resizeSubviews(withOldSize: oldSize)
-        fpsLabel.frame = NSRect(x: bounds.width - 70, y: 8, width: 60, height: 18)
+        fpsLabel.frame = NSRect(x: bounds.width - 65, y: 8, width: 55, height: 18)
     }
 
-    func update(image: CGImage?, hand: HandPoseData?, state: GestureState) {
+    func update(image: CGImage?, hand: HandPoseData?, state: GestureState, roi: CGRect) {
         if let image = image {
             currentImage = image
         }
         currentHand = hand
         currentState = state
+        roiRect = roi
 
         // FPS 계산 (카메라 + 비전 추론 프레임레이트)
         frameCount += 1
@@ -64,9 +67,18 @@ final class HUDView: NSView {
             fpsLabel.stringValue = String(format: "%.0f FPS", fps)
         }
 
+        if !AXIsProcessTrusted() {
+            statusLabel.stringValue = "⚠️ 손쉬운사용 권한 필요(클릭차단)"
+            statusLabel.textColor = .systemRed
+            needsDisplay = true
+            return
+        }
+
         let ratioStr: String
         if state == .fingerCurled {
             ratioStr = String(format: " · 접힘:%.2f", hand?.lowerFingerCurlRatio ?? 0.0)
+        } else if state == .scrolling {
+            ratioStr = String(format: " · 간격:%.2f", hand?.indexMiddleTipRatio ?? 0.0)
         } else if let ratio = hand?.pinchRatio {
             ratioStr = String(format: " · 핀치:%.2f", ratio)
         } else {
@@ -106,7 +118,21 @@ final class HUDView: NSView {
             ctx.restoreGState()
         }
 
-        // 2. 손 스켈레톤 드로잉
+        // 2. 유효 활동 영역(Active ROI) 가이드 박스 표시
+        ctx.saveGState()
+        let guideRect = CGRect(
+            x: roiRect.origin.x * b.width,
+            y: (1.0 - roiRect.maxY) * b.height,
+            width: roiRect.width * b.width,
+            height: roiRect.height * b.height
+        )
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.28).cgColor)
+        ctx.setLineWidth(1.0)
+        ctx.setLineDash(phase: 0, lengths: [4, 4])
+        ctx.stroke(guideRect)
+        ctx.restoreGState()
+
+        // 3. 손 스켈레톤 드로잉
         guard let hand = currentHand, hand.isValid else { return }
 
         ctx.saveGState()
@@ -139,7 +165,7 @@ final class HUDView: NSView {
             } else if joint == .thumbTip {
                 ctx.setFillColor(currentState == .pinching ? NSColor.systemGreen.cgColor : NSColor.systemYellow.cgColor)
             } else if joint == .middleTip {
-                ctx.setFillColor(currentState == .rightClicking ? NSColor.systemOrange.cgColor : NSColor.white.cgColor)
+                ctx.setFillColor(currentState == .rightClicking ? NSColor.systemOrange.cgColor : (currentState == .scrolling ? NSColor.systemCyan.cgColor : NSColor.white.cgColor))
             } else if joint == .ringTip || joint == .littleTip {
                 ctx.setFillColor(currentState == .fingerCurled ? NSColor.systemGreen.cgColor : NSColor.white.withAlphaComponent(0.8).cgColor)
             } else {
@@ -149,7 +175,7 @@ final class HUDView: NSView {
             ctx.fillEllipse(in: rect)
         }
 
-        // 3. 핀치 시 검지와 엄지 연결 하이라이트 링
+        // 4. 핀치 시 검지와 엄지 연결 하이라이트 링
         if let idx = hand.indexTip, let thm = hand.thumbTip {
             let ptIdx = CGPoint(x: (1.0 - idx.x) * b.width, y: idx.y * b.height)
             let ptThm = CGPoint(x: (1.0 - thm.x) * b.width, y: thm.y * b.height)
@@ -197,12 +223,13 @@ final class FloatingHUD: NSPanel {
         backgroundColor = .clear
         isOpaque = false
         hasShadow = true
-        ignoresMouseEvents = false
+        // 기본적으로 마우스 클릭이 미니 뷰어를 통과하도록 설정하여 우측 상단(탭/창 닫기/링크) 클릭 간섭 방지
+        ignoresMouseEvents = true
         contentView = hudView
     }
 
     /// 백그라운드 큐에서 안전하게 호출됨
-    func renderFrame(buffer: CVImageBuffer?, hand: HandPoseData?, state: GestureState) {
+    func renderFrame(buffer: CVImageBuffer?, hand: HandPoseData?, state: GestureState, roi: CGRect) {
         var cgImage: CGImage?
 
         // 배경 비디오 이미지는 2프레임당 1회만 변환하여 CPU/GPU 부담 60% 절감
@@ -213,7 +240,7 @@ final class FloatingHUD: NSPanel {
         }
 
         DispatchQueue.main.async { [weak self] in
-            self?.hudView.update(image: cgImage, hand: hand, state: state)
+            self?.hudView.update(image: cgImage, hand: hand, state: state, roi: roi)
         }
     }
 }

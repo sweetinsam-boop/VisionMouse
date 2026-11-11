@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="build/VisionMouse.app"
+pkill -x VisionMouse 2>/dev/null && sleep 0.2 || true
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -23,8 +24,13 @@ swiftc -O \
 
 cp Info.plist "$APP/Contents/Info.plist"
 
-# Code signing. Use developer ID if provided, otherwise ad-hoc (-).
-SIGN_IDENTITY="${SIGN_ID:--}"
+# Code signing: 자동으로 Apple Development 인증서를 탐색하여 재빌드 시에도 손쉬운 사용(TCC) 권한이 풀리지 않도록 고정
+if [[ -z "${SIGN_ID:-}" ]]; then
+  DETECTED_ID=$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -n 1 || true)
+  SIGN_IDENTITY="${DETECTED_ID:--}"
+else
+  SIGN_IDENTITY="$SIGN_ID"
+fi
 codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" >/dev/null
 
 echo "==> Successfully built $APP (signed with: $SIGN_IDENTITY)"

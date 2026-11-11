@@ -8,26 +8,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     private let cameraManager = CameraManager()
     private let handDetector = HandPoseDetector()
     private let gestureEngine = GestureEngine()
+    private let defaults = UserDefaults.standard
     private var hud: FloatingHUD?
     private var isHUDVisible = true
+    private var isHUDMovable = false
     private var isPaused = false
+    private var globalKeyMonitor: Any?
+    private var localKeyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        loadPreferences()
         checkAccessibilityPermission()
 
         setupStatusItem()
         setupPipeline()
+        setupGlobalShortcut()
 
         hud = FloatingHUD()
-        hud?.orderFront(nil)
+        hud?.ignoresMouseEvents = !isHUDMovable
+        if isHUDVisible {
+            hud?.orderFront(nil)
+        }
 
         startTracking()
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        if let gm = globalKeyMonitor { NSEvent.removeMonitor(gm) }
+        if let lm = localKeyMonitor { NSEvent.removeMonitor(lm) }
+        cameraManager.stop()
+    }
+
+    private func loadPreferences() {
+        defaults.register(defaults: [
+            "isHUDVisible": true,
+            "isLowLatencyMode": true,
+            "sensitivity": SensitivityLevel.normal.rawValue,
+            "clickTriggerMode": ClickTriggerMode.both.rawValue
+        ])
+        isHUDVisible = defaults.bool(forKey: "isHUDVisible")
+        cameraManager.isLowLatencyMode = defaults.bool(forKey: "isLowLatencyMode")
+        if let sensRaw = defaults.string(forKey: "sensitivity"),
+           let sens = SensitivityLevel(rawValue: sensRaw) {
+            gestureEngine.sensitivity = sens
+        }
+        if let modeRaw = defaults.string(forKey: "clickTriggerMode"),
+           let mode = ClickTriggerMode(rawValue: modeRaw) {
+            gestureEngine.clickTriggerMode = mode
+        }
+    }
+
+    private func setupGlobalShortcut() {
+        // Control + Option + Space 전역 단축키로 언제든 즉시 일시정지/재개 토글
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags == [.control, .option] && event.keyCode == 49 { // 49 = Space
+                DispatchQueue.main.async {
+                    self?.togglePause()
+                }
+            }
+        }
+        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handler(event)
+            return event
+        }
+    }
+
     private func checkAccessibilityPermission() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        if !AXIsProcessTrustedWithOptions(options) {
-            NSLog("[VisionMouse] Accessibility permission needed for mouse events.")
+        if !AXIsProcessTrusted() {
+            // 기존 ad-hoc 서명 빌드에서 생성된 구버전 TCC 엔트리가 남아 있으면 권한 토글이 켜져 있어도 클릭/스크롤이 차단됨.
+            // 개발자 인증서 서명 빌드로 최초 전환 시 1회 자동 리셋하여 정상 팝업을 유도.
+            if !defaults.bool(forKey: "didResetAdhocTCC_v2") {
+                defaults.set(true, forKey: "didResetAdhocTCC_v2")
+                let task = Process()
+                task.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+                task.arguments = ["reset", "Accessibility", "com.aimmac.VisionMouse"]
+                try? task.run()
+                task.waitUntilExit()
+            }
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            if !AXIsProcessTrustedWithOptions(options) {
+                NSLog("[VisionMouse] Accessibility permission needed for mouse events.")
+            }
         }
     }
 
@@ -35,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             btn.title = "👆"
-            btn.toolTip = "VisionMouse (웹캠 손가락 에어마우스)"
+            btn.toolTip = "VisionMouse (웹캠 손가락 에어마우스 · 일시정지 단축키: ⌃⌥Space)"
         }
         buildMenu()
     }
@@ -43,10 +106,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     private func buildMenu() {
         let menu = NSMenu()
 
-        let statusTitle = isPaused ? "상태: ⏸️ 일시정지됨" : "상태: 🟢 작동 중 (240Hz 보간)"
+        let statusTitle = isPaused
+            ? "상태: ⏸️ 일시정지됨 (클릭 또는 ⌃⌥Space로 재개)"
+            : "상태: 🟢 작동 중 (클릭 또는 ⌃⌥Space로 일시정지)"
         let statusMenuItem = NSMenuItem(title: statusTitle, action: #selector(togglePause), keyEquivalent: "")
         statusMenuItem.target = self
         menu.addItem(statusMenuItem)
+
+        if !AXIsProcessTrusted() {
+            let axItem = NSMenuItem(title: "⚠️ 손쉬운 사용 권한 필요 (클릭·스크롤 활성화)", action: #selector(resetAndPromptAccessibility), keyEquivalent: "")
+            axItem.target = self
+            menu.addItem(axItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -82,6 +153,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         hudMenuItem.target = self
         menu.addItem(hudMenuItem)
 
+        let hudMoveItem = NSMenuItem(title: isHUDMovable ? "미니 뷰어 위치 고정 (클릭 통과 켜기)" : "미니 뷰어 드래그 이동 허용", action: #selector(toggleHUDMovable), keyEquivalent: "")
+        hudMoveItem.target = self
+        hudMoveItem.state = isHUDMovable ? .on : .off
+        menu.addItem(hudMoveItem)
+
         let sensitivityMenu = NSMenu()
         for level in SensitivityLevel.allCases {
             let it = NSMenuItem(title: level.rawValue, action: #selector(setSensitivityLevel(_:)), keyEquivalent: "")
@@ -95,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         sensItem.submenu = sensitivityMenu
         menu.addItem(sensItem)
 
-        // 3. 클릭 방식 선택 (약지+새끼 접기 vs 핀치)
+        // 3. 클릭 방식 선택 (둘 다 허용 / 약지+새끼 접기 / 핀치)
         let clickMenu = NSMenu()
         for mode in ClickTriggerMode.allCases {
             let it = NSMenuItem(title: mode.rawValue, action: #selector(setClickTriggerMode(_:)), keyEquivalent: "")
@@ -114,19 +190,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         tip1.isEnabled = false
         menu.addItem(tip1)
 
-        let tip2 = NSMenuItem(title: "💡 약지+새끼 접기: 흔들림 없는 좌클릭 / 드래그", action: nil, keyEquivalent: "")
+        let tip2 = NSMenuItem(title: "💡 엄지+검지 핀치 / 약지+새끼 접기: 좌클릭·더블클릭·드래그", action: nil, keyEquivalent: "")
         tip2.isEnabled = false
         menu.addItem(tip2)
 
-        let tip3 = NSMenuItem(title: "💡 엄지+검지 핀치: 보조 좌클릭", action: nil, keyEquivalent: "")
+        let tip3 = NSMenuItem(title: "💡 엄지+중지 핀치: 우클릭", action: nil, keyEquivalent: "")
         tip3.isEnabled = false
         menu.addItem(tip3)
 
-        let tip4 = NSMenuItem(title: "💡 엄지+중지 핀치: 우클릭", action: nil, keyEquivalent: "")
+        let tip4 = NSMenuItem(title: "💡 검지+중지 나란히 펴고 상하 이동: 부드러운 스크롤", action: nil, keyEquivalent: "")
         tip4.isEnabled = false
         menu.addItem(tip4)
 
-        let tip5 = NSMenuItem(title: "💡 검지+중지 모아 상하: 스크롤", action: nil, keyEquivalent: "")
+        let tip5 = NSMenuItem(title: "💡 단축키 ⌃⌥Space: 즉시 일시정지 / 재개", action: nil, keyEquivalent: "")
         tip5.isEnabled = false
         menu.addItem(tip5)
 
@@ -162,6 +238,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
 
     // MARK: - Actions
 
+    @objc private func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func resetAndPromptAccessibility() {
+        // 기존 ad-hoc 서명 시절 묶인 구버전 TCC 항목을 초기화하고 새 인증서 기준으로 권한 팝업 재요청
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        task.arguments = ["reset", "Accessibility", "com.aimmac.VisionMouse"]
+        try? task.run()
+        task.waitUntilExit()
+
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        openAccessibilitySettings()
+    }
+
     @objc private func selectCameraDevice(_ sender: NSMenuItem) {
         if let uid = sender.representedObject as? String {
             cameraManager.switchDevice(uniqueID: uid)
@@ -172,13 +267,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     }
 
     @objc private func toggleLowLatency() {
-        cameraManager.setLowLatencyMode(!cameraManager.isLowLatencyMode)
+        let next = !cameraManager.isLowLatencyMode
+        defaults.set(next, forKey: "isLowLatencyMode")
+        cameraManager.setLowLatencyMode(next)
         buildMenu()
     }
 
     @objc private func setClickTriggerMode(_ sender: NSMenuItem) {
         if let mode = sender.representedObject as? ClickTriggerMode {
             gestureEngine.clickTriggerMode = mode
+            defaults.set(mode.rawValue, forKey: "clickTriggerMode")
             buildMenu()
         }
     }
@@ -186,6 +284,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     @objc private func togglePause() {
         isPaused.toggle()
         gestureEngine.isEnabled = !isPaused
+        if isPaused {
+            cameraManager.stop()
+            hud?.renderFrame(buffer: nil, hand: nil, state: .idle, roi: gestureEngine.currentROIRect)
+        } else {
+            cameraManager.start()
+        }
         if let btn = statusItem.button {
             btn.title = isPaused ? "⏸️" : "👆"
         }
@@ -194,6 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
 
     @objc private func toggleHUD() {
         isHUDVisible.toggle()
+        defaults.set(isHUDVisible, forKey: "isHUDVisible")
         if isHUDVisible {
             hud?.orderFront(nil)
         } else {
@@ -202,9 +307,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         buildMenu()
     }
 
+    @objc private func toggleHUDMovable() {
+        isHUDMovable.toggle()
+        hud?.ignoresMouseEvents = !isHUDMovable
+        buildMenu()
+    }
+
     @objc private func setSensitivityLevel(_ sender: NSMenuItem) {
         if let level = sender.representedObject as? SensitivityLevel {
             gestureEngine.sensitivity = level
+            defaults.set(level.rawValue, forKey: "sensitivity")
             buildMenu()
         }
     }
@@ -217,6 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     // MARK: - CameraManagerDelegate
 
     func cameraManager(_ manager: CameraManager, didOutput sampleBuffer: CMSampleBuffer) {
+        guard !isPaused else { return }
         handDetector.process(sampleBuffer: sampleBuffer)
     }
 
@@ -225,7 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     func handPoseDetector(_ detector: HandPoseDetector, didDetect hand: HandPoseData?, frame: CVImageBuffer) {
         gestureEngine.process(hand: hand)
         if isHUDVisible {
-            hud?.renderFrame(buffer: frame, hand: hand, state: gestureEngine.currentState)
+            hud?.renderFrame(buffer: frame, hand: hand, state: gestureEngine.currentState, roi: gestureEngine.currentROIRect)
         }
     }
 
