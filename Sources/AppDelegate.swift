@@ -2,6 +2,7 @@ import AppKit
 import CoreMedia
 import ApplicationServices
 import AVFoundation
+import Carbon.HIToolbox
 
 final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate, HandPoseDetectorDelegate, GestureEngineDelegate {
     private var statusItem: NSStatusItem!
@@ -13,8 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     private var isHUDVisible = true
     private var isHUDMovable = false
     private var isPaused = false
-    private var globalKeyMonitor: Any?
-    private var localKeyMonitor: Any?
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         loadPreferences()
@@ -34,8 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let gm = globalKeyMonitor { NSEvent.removeMonitor(gm) }
-        if let lm = localKeyMonitor { NSEvent.removeMonitor(lm) }
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref) }
+        if let h = hotKeyHandler { RemoveEventHandler(h) }
         cameraManager.stop()
     }
 
@@ -59,19 +60,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     }
 
     private func setupGlobalShortcut() {
-        // Control + Option + Space 전역 단축키로 언제든 즉시 일시정지/재개 토글
-        let handler: (NSEvent) -> Void = { [weak self] event in
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags == [.control, .option] && event.keyCode == 49 { // 49 = Space
-                DispatchQueue.main.async {
-                    self?.togglePause()
-                }
-            }
-        }
-        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
-        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            handler(event)
-            return event
+        // Control + Option + Space 등록형 핫키: 손쉬운 사용 권한 없이 동작하고, 키를 소비해 앞쪽 앱에 전달되지 않음
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+            guard let userData = userData else { return noErr }
+            let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async { me.togglePause() }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
+
+        let hotKeyID = EventHotKeyID(signature: OSType(0x564D_5345), id: 1) // 'VMSE'
+        let status = RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey), hotKeyID,
+                                         GetApplicationEventTarget(), 0, &hotKeyRef)
+        if status != noErr {
+            NSLog("[VisionMouse] ⌃⌥Space 핫키 등록 실패 (다른 앱이 사용 중일 수 있음): %d", status)
         }
     }
 

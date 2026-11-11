@@ -88,7 +88,13 @@ final class GestureEngine {
 
     // 우클릭 임계값
     var rightPinchThreshold: CGFloat = 0.28
+    /// 우클릭 후 엄지·중지가 이 비율 이상 벌어져야 다음 우클릭 가능 (붙인 채 유지 시 반복 발동 방지)
+    var rightPinchRelease: CGFloat = 0.40
     private var lastRightClickTime: CFAbsoluteTime = 0.0
+    private var isRightClickArmed = true
+
+    /// 클릭 진입 판정에 필요한 손끝 최소 신뢰도 (모션블러·가림 프레임의 오클릭 방지)
+    var minClickConfidence: Float = 0.5
 
     // 스크롤 상태 및 서브픽셀 누적기
     private var isScrolling = false
@@ -309,6 +315,7 @@ final class GestureEngine {
             isDragging = false
             isScrolling = false
             isCurlArmed = false
+            isRightClickArmed = true
             isApproachingClick = false
             filterX.reset()
             filterY.reset()
@@ -351,6 +358,12 @@ final class GestureEngine {
         let pinchRatio = hand.pinchRatio ?? 1.0
         let middlePinchRatio = hand.middlePinchRatio ?? 1.0
         let curlRatio = hand.lowerFingerCurlRatio
+        // 신뢰도 게이트는 클릭 '진입'에만 적용. 해제·이동은 그대로 두어 누른 채 끊기는 일을 막는다.
+        let pinchTipsReliable = min(hand.confidence(.thumbTip), hand.confidence(.indexTip)) >= minClickConfidence
+        let rightTipsReliable = min(hand.confidence(.thumbTip), hand.confidence(.middleTip)) >= minClickConfidence
+        if middlePinchRatio > rightPinchRelease {
+            isRightClickArmed = true
+        }
 
         // 약지/새끼손가락이 연속 4프레임 이상 확실히 펴진 상태가 확인되면 curl 클릭 무장
         if curlRatio >= curlThresholdExit {
@@ -387,9 +400,11 @@ final class GestureEngine {
         // 5. 제스처 판정
 
         // A. 엄지-중지 우클릭 감지 (좌클릭/드래그/스크롤 중이 아닐 때)
-        if !isPressed && !isScrolling && middlePinchRatio < rightPinchThreshold && pinchRatio > pinchThresholdEnter {
+        if !isPressed && !isScrolling && isRightClickArmed && rightTipsReliable
+            && middlePinchRatio < rightPinchThreshold && pinchRatio > pinchThresholdEnter {
             if now - lastRightClickTime > 0.55 {
                 lastRightClickTime = now
+                isRightClickArmed = false
                 let clickPt = cleanHoverHistory.last?.p ?? currentPoint ?? rawTarget
                 lock.unlock()
                 triggerRightClick(at: clickPt)
@@ -464,7 +479,7 @@ final class GestureEngine {
 
         // C. 좌클릭 / 드래그 판정
         // 스크롤 자세(검지+중지 밀착 폄) 진행 중에는 약지/새끼 접힘 클릭을 억제하여 오작동 방지
-        let pinchTriggered = isPinchActive && ((pinchRatio < pinchThresholdEnter) || (rawDist < pinchRawDistMax))
+        let pinchTriggered = isPinchActive && pinchTipsReliable && ((pinchRatio < pinchThresholdEnter) || (rawDist < pinchRawDistMax))
         let curlTriggered = isCurlActive && isCurlArmed && !scrollPoseMatched && (curlRatio < curlThresholdEnter)
         let clickTriggered = pinchTriggered || curlTriggered
 

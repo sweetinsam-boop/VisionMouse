@@ -20,7 +20,8 @@ swiftc -O \
   -framework CoreMedia \
   -framework CoreVideo \
   -framework ApplicationServices \
-  -framework CoreGraphics
+  -framework CoreGraphics \
+  -framework Carbon
 
 cp Info.plist "$APP/Contents/Info.plist"
 

@@ -473,6 +473,69 @@ enum SelfTestRunner {
             try assertTrue(engine.currentState == .pointing, "이동 종료 후 상태가 .pointing이어야 함 (실제: \(engine.currentState))")
         }
 
+        // 11. 손 고정: 두 번째 손이 들어와도 원래 손(같은 좌우, 가까운 위치)을 유지
+        check("11. 손 고정 (chirality + 근접도 선택)") {
+            let right = (chirality: VNChirality.right, indexTip: CGPoint(x: 0.30, y: 0.50) as CGPoint?)
+            let left = (chirality: VNChirality.left, indexTip: CGPoint(x: 0.52, y: 0.50) as CGPoint?)
+            let last = CGPoint(x: 0.50, y: 0.50)
+            try assertTrue(HandPoseDetector.selectHand(candidates: [left, right], locked: .right, lastIndexTip: last) == 1,
+                           "고정된 오른손이 더 멀어도 오른손을 골라야 함")
+            try assertTrue(HandPoseDetector.selectHand(candidates: [right, left], locked: .unknown, lastIndexTip: last) == 1,
+                           "좌우 미고정이면 직전 검지에 가까운 손을 골라야 함")
+            try assertTrue(HandPoseDetector.selectHand(candidates: [left], locked: .right, lastIndexTip: last) == 0,
+                           "고정된 손이 없으면 남은 손으로 폴백해야 함")
+            try assertTrue(HandPoseDetector.selectHand(candidates: [], locked: .right, lastIndexTip: last) == nil,
+                           "후보가 없으면 nil")
+        }
+
+        // 12. 우클릭 재무장: 붙인 채 1초 유지해도 1회, 뗐다 다시 붙이면 2회
+        check("12. 우클릭 재무장 (손가락을 떼야 다음 우클릭)") {
+            let engine = GestureEngine(startInterpolator: false)
+            engine.suppressSystemEvents = true
+            var rightClicks = 0
+            engine.onEventEmitted = { ev in
+                if case .rightUp = ev.kind { rightClicks += 1 }
+            }
+            func rightPinch(_ t: CFAbsoluteTime) -> HandPoseData {
+                makeHand(timestamp: t, indexTip: CGPoint(x: 0.46, y: 0.65),
+                         thumbTip: CGPoint(x: 0.50, y: 0.45), middleTip: CGPoint(x: 0.51, y: 0.46))
+            }
+            var t: CFAbsoluteTime = 900.0
+            for _ in 0..<60 { t += 1.0 / 60.0; engine.process(hand: rightPinch(t)) }
+            try assertTrue(rightClicks == 1, "붙인 채 유지 시 우클릭 1회여야 함 (발생: \(rightClicks))")
+
+            for _ in 0..<5 {
+                t += 1.0 / 60.0
+                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.46, y: 0.65),
+                                              thumbTip: CGPoint(x: 0.36, y: 0.45), middleTip: CGPoint(x: 0.54, y: 0.42)))
+            }
+            t += 1.0 / 60.0
+            engine.process(hand: rightPinch(t))
+            try assertTrue(rightClicks == 2, "뗐다 다시 붙이면 우클릭 2회여야 함 (발생: \(rightClicks))")
+        }
+
+        // 13. 신뢰도 게이트: 손끝 신뢰도가 낮은 핀치는 클릭으로 진입하지 않음
+        check("13. 저신뢰 손끝 핀치 무시") {
+            let engine = GestureEngine(startInterpolator: false)
+            engine.suppressSystemEvents = true
+            engine.clickTriggerMode = .pinch
+            var t: CFAbsoluteTime = 1000.0
+            for _ in 0..<10 {
+                t += 1.0 / 60.0
+                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.65), thumbTip: CGPoint(x: 0.36, y: 0.48)))
+            }
+            var blurry = makeHand(timestamp: t + 1.0 / 60.0, indexTip: CGPoint(x: 0.50, y: 0.60), thumbTip: CGPoint(x: 0.49, y: 0.59))
+            blurry.confidences[.indexTip] = 0.30
+            engine.process(hand: blurry)
+            try assertTrue(!engine.isPressed, "신뢰도 0.30 손끝으로는 핀치가 눌리면 안 됨")
+
+            var clear = blurry
+            clear.timestamp += 1.0 / 60.0
+            clear.confidences[.indexTip] = 0.90
+            engine.process(hand: clear)
+            try assertTrue(engine.isPressed, "신뢰도 0.90이면 핀치가 눌려야 함")
+        }
+
         print("====================================================")
         print("📊 테스트 결과 요약: 총 \(passed + failed)개 중 \(passed)개 통과, \(failed)개 실패")
         print("====================================================")

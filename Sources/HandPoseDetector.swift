@@ -35,6 +35,11 @@ struct HandPoseData {
 
     var wrist: CGPoint? { points[.wrist] }
 
+    /// 관절 신뢰도. 합성 테스트 데이터처럼 신뢰도가 없으면 1.0으로 본다.
+    func confidence(_ joint: VNHumanHandPoseObservation.JointName) -> Float {
+        confidences[joint] ?? (points[joint] == nil ? 0 : 1)
+    }
+
     var isValid: Bool {
         // 손목이 화각 밖으로 나가더라도 손가락 관절들이 보이면 유효한 손으로 판정
         indexTip != nil && thumbTip != nil && (wrist != nil || indexMCP != nil || thumbMP != nil)
@@ -283,9 +288,46 @@ final class HandPoseDetector {
     private let handPoseRequest: VNDetectHumanHandPoseRequest
     private let confidenceThreshold: Float = 0.25
 
+    // 손 고정: 처음 잡은 손의 좌우(chirality)와 직전 검지 위치로 같은 손을 계속 추적
+    private var lockedChirality: VNChirality = .unknown
+    private var lastIndexTip: CGPoint?
+    private var missStreak = 0
+
     init() {
         handPoseRequest = VNDetectHumanHandPoseRequest()
-        handPoseRequest.maximumHandCount = 1
+        // 두 손을 받아야 두 번째 손이 들어와도 원래 손을 골라낼 수 있음
+        handPoseRequest.maximumHandCount = 2
+    }
+
+    /// 후보 손 중 추적할 손의 인덱스. 고정된 좌우가 있으면 그 손만, 그중 직전 검지에 가장 가까운 손을 고른다.
+    static func selectHand(
+        candidates: [(chirality: VNChirality, indexTip: CGPoint?)],
+        locked: VNChirality,
+        lastIndexTip: CGPoint?
+    ) -> Int? {
+        guard !candidates.isEmpty else { return nil }
+        var pool = Array(candidates.indices)
+        if locked != .unknown {
+            let same = pool.filter { candidates[$0].chirality == locked }
+            if !same.isEmpty { pool = same }
+        }
+        guard let last = lastIndexTip else { return pool.first }
+        return pool.min { a, b in
+            let da = candidates[a].indexTip.map { hypot($0.x - last.x, $0.y - last.y) } ?? .infinity
+            let db = candidates[b].indexTip.map { hypot($0.x - last.x, $0.y - last.y) } ?? .infinity
+            return da < db
+        }
+    }
+
+    /// 카메라 촬영 시각(PTS)을 CFAbsoluteTime 기준으로 환산. Vision 추론 시간 편차가 1€ 필터 dt에 섞이지 않게 한다.
+    static func captureTimestamp(of sampleBuffer: CMSampleBuffer) -> CFAbsoluteTime {
+        let now = CFAbsoluteTimeGetCurrent()
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard pts.isValid else { return now }
+        let age = CMClockGetTime(CMClockGetHostTimeClock()).seconds - pts.seconds
+        // PTS가 호스트 시계 기준이 아니면(외장 장치 등) 현재 시각으로 폴백
+        guard age >= 0, age < 0.5 else { return now }
+        return now - age
     }
 
     func process(sampleBuffer: CMSampleBuffer) {
@@ -294,12 +336,27 @@ final class HandPoseDetector {
 
         do {
             try handler.perform([handPoseRequest])
-            let timestamp = CFAbsoluteTimeGetCurrent()
+            let timestamp = HandPoseDetector.captureTimestamp(of: sampleBuffer)
 
-            guard let observation = handPoseRequest.results?.first else {
+            let observations = handPoseRequest.results ?? []
+            let candidates = observations.map { obs -> (chirality: VNChirality, indexTip: CGPoint?) in
+                let tip = (try? obs.recognizedPoint(.indexTip)).flatMap { $0.confidence >= confidenceThreshold ? $0.location : nil }
+                return (obs.chirality, tip)
+            }
+            guard let idx = HandPoseDetector.selectHand(candidates: candidates, locked: lockedChirality, lastIndexTip: lastIndexTip) else {
+                // 한두 프레임 놓친 것으로 고정을 풀지 않도록 약 0.5초(15프레임) 연속 미검출 시에만 해제
+                missStreak += 1
+                if missStreak >= 15 {
+                    lockedChirality = .unknown
+                    lastIndexTip = nil
+                }
                 delegate?.handPoseDetector(self, didDetect: nil, frame: pixelBuffer)
                 return
             }
+            missStreak = 0
+            let observation = observations[idx]
+            if lockedChirality == .unknown { lockedChirality = observation.chirality }
+            lastIndexTip = candidates[idx].indexTip ?? lastIndexTip
 
             let recognizedPoints = try observation.recognizedPoints(.all)
             let w = CVPixelBufferGetWidth(pixelBuffer)
