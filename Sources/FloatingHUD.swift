@@ -8,6 +8,8 @@ final class HUDView: NSView {
     private var currentHand: HandPoseData?
     private var currentState: GestureState = .noHand
     private var roiRect: CGRect = CGRect(x: 0.20, y: 0.20, width: 0.60, height: 0.60)
+    private var clickArmed = false
+    private var clickProgress: CGFloat = 0.0
     private var fps: Double = 0.0
     private var frameCount = 0
     private var lastFpsCalcTime = CFAbsoluteTimeGetCurrent()
@@ -48,13 +50,16 @@ final class HUDView: NSView {
         fpsLabel.frame = NSRect(x: bounds.width - 65, y: 8, width: 55, height: 18)
     }
 
-    func update(image: CGImage?, hand: HandPoseData?, state: GestureState, roi: CGRect) {
+    func update(image: CGImage?, hand: HandPoseData?, state: GestureState, roi: CGRect,
+                feedback: (armed: Bool, progress: CGFloat)) {
         if let image = image {
             currentImage = image
         }
         currentHand = hand
         currentState = state
         roiRect = roi
+        clickArmed = feedback.armed
+        clickProgress = feedback.progress
 
         // FPS 계산 (카메라 + 비전 추론 프레임레이트)
         frameCount += 1
@@ -75,22 +80,20 @@ final class HUDView: NSView {
         }
 
         let ratioStr: String
-        if state == .fingerCurled {
-            ratioStr = String(format: " · 접힘:%.2f", hand?.lowerFingerCurlRatio ?? 0.0)
-        } else if state == .scrolling {
+        if state == .scrolling {
             ratioStr = String(format: " · 간격:%.2f", hand?.indexMiddleTipRatio ?? 0.0)
-        } else if let ratio = hand?.pinchRatio {
-            ratioStr = String(format: " · 핀치:%.2f", ratio)
+        } else if let ratio = hand?.thumbIndexRatio {
+            ratioStr = String(format: " · 엄지:%.2f", ratio)
         } else {
             ratioStr = ""
         }
 
-        statusLabel.stringValue = state.rawValue + ratioStr
+        // 엄지를 붙인 채 손을 들이밀면 무장 전이라 클릭이 안 되므로 안내
+        let hint = (state == .pointing && !feedback.armed) ? " · 엄지를 벌리세요" : ""
+        statusLabel.stringValue = state.rawValue + ratioStr + hint
         switch state {
-        case .pinching, .fingerCurled, .dragging:
+        case .thumbTouching, .dragging:
             statusLabel.textColor = .systemGreen
-        case .rightClicking:
-            statusLabel.textColor = .systemOrange
         case .scrolling:
             statusLabel.textColor = .systemCyan
         case .pointing:
@@ -161,13 +164,11 @@ final class HUDView: NSView {
             let rect = CGRect(x: drawPt.x - radius, y: drawPt.y - radius, width: radius * 2, height: radius * 2)
 
             if joint == .indexTip {
-                ctx.setFillColor((currentState == .pinching || currentState == .fingerCurled) ? NSColor.systemGreen.cgColor : NSColor.systemCyan.cgColor)
+                ctx.setFillColor(NSColor.systemCyan.cgColor)
             } else if joint == .thumbTip {
-                ctx.setFillColor(currentState == .pinching ? NSColor.systemGreen.cgColor : NSColor.systemYellow.cgColor)
+                ctx.setFillColor((currentState == .thumbTouching || currentState == .dragging) ? NSColor.systemGreen.cgColor : NSColor.systemYellow.cgColor)
             } else if joint == .middleTip {
-                ctx.setFillColor(currentState == .rightClicking ? NSColor.systemOrange.cgColor : (currentState == .scrolling ? NSColor.systemCyan.cgColor : NSColor.white.cgColor))
-            } else if joint == .ringTip || joint == .littleTip {
-                ctx.setFillColor(currentState == .fingerCurled ? NSColor.systemGreen.cgColor : NSColor.white.withAlphaComponent(0.8).cgColor)
+                ctx.setFillColor(currentState == .scrolling ? NSColor.systemCyan.cgColor : NSColor.white.cgColor)
             } else {
                 ctx.setFillColor(NSColor.white.withAlphaComponent(0.8).cgColor)
             }
@@ -175,20 +176,22 @@ final class HUDView: NSView {
             ctx.fillEllipse(in: rect)
         }
 
-        // 4. 핀치 시 검지와 엄지 연결 하이라이트 링
-        if let idx = hand.indexTip, let thm = hand.thumbTip {
-            let ptIdx = CGPoint(x: (1.0 - idx.x) * b.width, y: idx.y * b.height)
-            let ptThm = CGPoint(x: (1.0 - thm.x) * b.width, y: thm.y * b.height)
-
-            if currentState == .pinching {
+        // 4. 엄지 끝 클릭 피드백 링: 다가가는 정도만큼 노란 호, 누름은 초록 원, 드래그는 파란 원
+        if let thm = hand.thumbTip {
+            let c = CGPoint(x: (1.0 - thm.x) * b.width, y: thm.y * b.height)
+            let ringRect = CGRect(x: c.x - 10, y: c.y - 10, width: 20, height: 20)
+            ctx.setLineWidth(3.0)
+            if currentState == .thumbTouching {
                 ctx.setStrokeColor(NSColor.systemGreen.cgColor)
-                ctx.setLineWidth(3.0)
-                ctx.move(to: ptIdx)
-                ctx.addLine(to: ptThm)
+                ctx.strokeEllipse(in: ringRect)
+            } else if currentState == .dragging {
+                ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+                ctx.strokeEllipse(in: ringRect)
+            } else if currentState == .pointing && clickArmed && clickProgress > 0.02 {
+                ctx.setStrokeColor(NSColor.systemYellow.cgColor)
+                ctx.addArc(center: c, radius: 10, startAngle: .pi / 2,
+                           endAngle: .pi / 2 - clickProgress * 2 * .pi, clockwise: true)
                 ctx.strokePath()
-
-                ctx.setStrokeColor(NSColor.systemGreen.cgColor)
-                ctx.strokeEllipse(in: CGRect(x: ptIdx.x - 10, y: ptIdx.y - 10, width: 20, height: 20))
             }
         }
 
@@ -229,7 +232,8 @@ final class FloatingHUD: NSPanel {
     }
 
     /// 백그라운드 큐에서 안전하게 호출됨
-    func renderFrame(buffer: CVImageBuffer?, hand: HandPoseData?, state: GestureState, roi: CGRect) {
+    func renderFrame(buffer: CVImageBuffer?, hand: HandPoseData?, state: GestureState, roi: CGRect,
+                     feedback: (armed: Bool, progress: CGFloat) = (false, 0)) {
         var cgImage: CGImage?
 
         // 배경 비디오 이미지는 2프레임당 1회만 변환하여 CPU/GPU 부담 60% 절감
@@ -240,7 +244,7 @@ final class FloatingHUD: NSPanel {
         }
 
         DispatchQueue.main.async { [weak self] in
-            self?.hudView.update(image: cgImage, hand: hand, state: state, roi: roi)
+            self?.hudView.update(image: cgImage, hand: hand, state: state, roi: roi, feedback: feedback)
         }
     }
 }

@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
     private var isHUDVisible = true
     private var isHUDMovable = false
     private var isPaused = false
+    private let recorder = LandmarkRecorder()
+    private var calibrationSamples: [CGFloat]?   // nil이 아니면 엄지 보정 수집 중 (메인 스레드에서만 접근)
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
 
@@ -44,8 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         defaults.register(defaults: [
             "isHUDVisible": true,
             "isLowLatencyMode": true,
-            "sensitivity": SensitivityLevel.normal.rawValue,
-            "clickTriggerMode": ClickTriggerMode.both.rawValue
+            "sensitivity": SensitivityLevel.normal.rawValue
         ])
         isHUDVisible = defaults.bool(forKey: "isHUDVisible")
         cameraManager.isLowLatencyMode = defaults.bool(forKey: "isLowLatencyMode")
@@ -53,9 +54,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
            let sens = SensitivityLevel(rawValue: sensRaw) {
             gestureEngine.sensitivity = sens
         }
-        if let modeRaw = defaults.string(forKey: "clickTriggerMode"),
-           let mode = ClickTriggerMode(rawValue: modeRaw) {
-            gestureEngine.clickTriggerMode = mode
+        gestureEngine.aimBlendKnuckle = defaults.bool(forKey: "aimBlendKnuckle")
+        // 엄지 보정 결과가 저장돼 있으면 적용 (뗌 > 누름일 때만)
+        let enter = defaults.double(forKey: "thumbTouchEnter")
+        let exit = defaults.double(forKey: "thumbTouchExit")
+        let approach = defaults.double(forKey: "thumbTouchApproach")
+        if enter > 0 && exit > enter && approach >= exit {
+            gestureEngine.thumbTouchEnter = CGFloat(enter)
+            gestureEngine.thumbTouchExit = CGFloat(exit)
+            gestureEngine.thumbTouchApproach = CGFloat(approach)
         }
     }
 
@@ -75,6 +82,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         if status != noErr {
             NSLog("[VisionMouse] ⌃⌥Space 핫키 등록 실패 (다른 앱이 사용 중일 수 있음): %d", status)
         }
+    }
+
+    /// `defaults write com.aimmac.VisionMouse scrollDebugLog -bool YES` 일 때만 ~/Library/Logs/VisionMouse/scroll.csv 기록
+    private func setupScrollDebugLog() {
+        guard defaults.bool(forKey: "scrollDebugLog") else { return }
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/VisionMouse")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("scroll.csv")
+        FileManager.default.createFile(atPath: url.path, contents: Data("# frame,t,refX,refY,palmScale,offX,offY,targetVx,targetVy | tick,t,dt,vx,vy,sx,sy\n".utf8))
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        handle.seekToEndOfFile()
+        let queue = DispatchQueue(label: "com.aimmac.VisionMouse.scrolllog")
+        gestureEngine.scrollDebugLog = { line in
+            queue.async { handle.write(Data((line + "\n").utf8)) }
+        }
+        NSLog("[VisionMouse] 스크롤 진단 로그: %@", url.path)
     }
 
     private func checkAccessibilityPermission() {
@@ -173,18 +196,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         sensItem.submenu = sensitivityMenu
         menu.addItem(sensItem)
 
-        // 3. 클릭 방식 선택 (둘 다 허용 / 약지+새끼 접기 / 핀치)
-        let clickMenu = NSMenu()
-        for mode in ClickTriggerMode.allCases {
-            let it = NSMenuItem(title: mode.rawValue, action: #selector(setClickTriggerMode(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = mode
-            it.state = (gestureEngine.clickTriggerMode == mode) ? .on : .off
-            clickMenu.addItem(it)
-        }
-        let clickItem = NSMenuItem(title: "클릭 제스처 방식", action: nil, keyEquivalent: "")
-        clickItem.submenu = clickMenu
-        menu.addItem(clickItem)
+        let aimItem = NSMenuItem(title: "조준: 검지 끝+관절 혼합 (클릭 시 흔들림 감소)", action: #selector(toggleAimBlend), keyEquivalent: "")
+        aimItem.target = self
+        aimItem.state = gestureEngine.aimBlendKnuckle ? .on : .off
+        menu.addItem(aimItem)
+
+        let calibItem = NSMenuItem(title: calibrationSamples == nil ? "엄지 클릭 보정…" : "엄지 클릭 보정 중…",
+                                   action: calibrationSamples == nil ? #selector(startThumbCalibration) : nil, keyEquivalent: "")
+        calibItem.target = self
+        menu.addItem(calibItem)
+
+        let recItem = NSMenuItem(title: recorder.isRecording ? "⏺ 손 동작 기록 중지" : "손 동작 기록 시작 (진단용, 최대 3분)",
+                                 action: #selector(toggleRecording), keyEquivalent: "")
+        recItem.target = self
+        menu.addItem(recItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -192,15 +217,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         tip1.isEnabled = false
         menu.addItem(tip1)
 
-        let tip2 = NSMenuItem(title: "💡 엄지+검지 핀치 / 약지+새끼 접기: 좌클릭·더블클릭·드래그", action: nil, keyEquivalent: "")
+        let tip2 = NSMenuItem(title: "💡 엄지를 검지에 붙였다 떼기: 좌클릭 (2회: 더블클릭, 붙인 채 이동: 드래그)", action: nil, keyEquivalent: "")
         tip2.isEnabled = false
         menu.addItem(tip2)
 
-        let tip3 = NSMenuItem(title: "💡 엄지+중지 핀치: 우클릭", action: nil, keyEquivalent: "")
-        tip3.isEnabled = false
-        menu.addItem(tip3)
-
-        let tip4 = NSMenuItem(title: "💡 검지+중지 나란히 펴고 상하 이동: 부드러운 스크롤", action: nil, keyEquivalent: "")
+        let tip4 = NSMenuItem(title: "💡 검지+중지 붙여 펴고 손을 기준점에서 이동: 조이스틱 스크롤", action: nil, keyEquivalent: "")
         tip4.isEnabled = false
         menu.addItem(tip4)
 
@@ -219,6 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
 
     private func setupPipeline() {
         cameraManager.delegate = self
+        setupScrollDebugLog()
         handDetector.delegate = self
         gestureEngine.delegate = self
     }
@@ -275,14 +297,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         buildMenu()
     }
 
-    @objc private func setClickTriggerMode(_ sender: NSMenuItem) {
-        if let mode = sender.representedObject as? ClickTriggerMode {
-            gestureEngine.clickTriggerMode = mode
-            defaults.set(mode.rawValue, forKey: "clickTriggerMode")
-            buildMenu()
-        }
-    }
-
     @objc private func togglePause() {
         isPaused.toggle()
         gestureEngine.isEnabled = !isPaused
@@ -323,6 +337,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
         }
     }
 
+    @objc private func toggleAimBlend() {
+        gestureEngine.aimBlendKnuckle.toggle()
+        defaults.set(gestureEngine.aimBlendKnuckle, forKey: "aimBlendKnuckle")
+        buildMenu()
+    }
+
+    @objc private func toggleRecording() {
+        if recorder.isRecording {
+            recorder.stop()
+            if let url = recorder.url {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
+        } else {
+            recorder.onAutoStop = { [weak self] in self?.buildMenu() }
+            if recorder.start() == nil {
+                NSLog("[VisionMouse] 기록 파일을 만들 수 없음")
+            }
+        }
+        buildMenu()
+    }
+
+    /// 4초 동안 엄지를 벌렸다 붙였다 하게 해서 thumbIndexRatio 분포로 임계값을 정한다. 수집 중에는 클릭이 나가지 않게 엔진을 끈다.
+    @objc private func startThumbCalibration() {
+        let intro = NSAlert()
+        intro.messageText = "엄지 클릭 보정"
+        intro.informativeText = "확인을 누른 뒤 4초 동안, 검지를 펴고 엄지를 L자로 벌렸다가 검지에 붙이기를 천천히 3번 반복하세요.\n보정 중에는 클릭이 나가지 않습니다."
+        intro.addButton(withTitle: "시작")
+        intro.addButton(withTitle: "취소")
+        NSApp.activate(ignoringOtherApps: true)
+        guard intro.runModal() == .alertFirstButtonReturn else { return }
+
+        calibrationSamples = []
+        gestureEngine.isEnabled = false
+        buildMenu()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+            self?.finishThumbCalibration()
+        }
+    }
+
+    private func finishThumbCalibration() {
+        let samples = calibrationSamples ?? []
+        calibrationSamples = nil
+        gestureEngine.isEnabled = !isPaused
+        buildMenu()
+
+        let result = NSAlert()
+        if let th = ThumbCalibration.thresholds(from: samples) {
+            gestureEngine.thumbTouchEnter = th.enter
+            gestureEngine.thumbTouchExit = th.exit
+            gestureEngine.thumbTouchApproach = th.approach
+            defaults.set(Double(th.enter), forKey: "thumbTouchEnter")
+            defaults.set(Double(th.exit), forKey: "thumbTouchExit")
+            defaults.set(Double(th.approach), forKey: "thumbTouchApproach")
+            result.messageText = "보정 완료"
+            result.informativeText = String(format: "누름 %.2f · 뗌 %.2f · 접근 %.2f (샘플 %d개)", th.enter, th.exit, th.approach, samples.count)
+        } else {
+            result.messageText = "보정 실패"
+            result.informativeText = "엄지를 벌린 값과 붙인 값의 차이가 충분하지 않거나 손이 잘 보이지 않았습니다 (샘플 \(samples.count)개). 기존 값을 유지합니다."
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        result.runModal()
+    }
+
     @objc private func quitApp() {
         cameraManager.stop()
         NSApp.terminate(nil)
@@ -339,8 +416,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CameraManagerDelegate,
 
     func handPoseDetector(_ detector: HandPoseDetector, didDetect hand: HandPoseData?, frame: CVImageBuffer) {
         gestureEngine.process(hand: hand)
+        recorder.append(hand)
+        if let r = hand?.thumbIndexRatio {
+            DispatchQueue.main.async { [weak self] in self?.calibrationSamples?.append(r) }
+        }
         if isHUDVisible {
-            hud?.renderFrame(buffer: frame, hand: hand, state: gestureEngine.currentState, roi: gestureEngine.currentROIRect)
+            hud?.renderFrame(buffer: frame, hand: hand, state: gestureEngine.currentState, roi: gestureEngine.currentROIRect,
+                             feedback: gestureEngine.clickFeedback)
         }
     }
 

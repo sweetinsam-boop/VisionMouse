@@ -156,6 +156,33 @@ struct HandPoseData {
         fingerExtensionRatio(mcp: littleMCP, pip: littlePIP, dip: littleDIP, tip: littleTip) ?? 0.0
     }
 
+    /// 조이스틱 스크롤 기준점: 검지·중지 MCP 중점 (없으면 손가락 끝 중점)
+    var scrollReferencePoint: CGPoint? {
+        if let a = indexMCP, let b = middleMCP { return CGPoint(x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5) }
+        if let a = indexTip, let b = middleTip { return CGPoint(x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5) }
+        return nil
+    }
+
+    /// 엄지-검지 붙임 비율: 엄지 끝과 검지(MCP→PIP→DIP→Tip 꺾은선) 사이 최단 거리 / palmScale.
+    /// L자로 엄지를 벌리면 ~0.6 이상, 엄지를 검지 옆면(또는 끝)에 붙이면 0.25 미만.
+    var thumbIndexRatio: CGFloat? {
+        guard let thm = thumbTip else { return nil }
+        let chain = [indexMCP, indexPIP, indexDIP, indexTip].compactMap { $0 }
+        guard chain.count >= 2 else { return nil }
+        // 종횡비 보정 좌표에서 점-선분 거리
+        func scaled(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x * aspectRatio, y: p.y) }
+        let p = scaled(thm)
+        var best = CGFloat.infinity
+        for i in 0..<(chain.count - 1) {
+            let a = scaled(chain[i]), b = scaled(chain[i + 1])
+            let ab = CGPoint(x: b.x - a.x, y: b.y - a.y)
+            let len2 = ab.x * ab.x + ab.y * ab.y
+            let t = len2 > 0 ? min(max(((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2, 0), 1) : 0
+            best = min(best, hypot(p.x - (a.x + t * ab.x), p.y - (a.y + t * ab.y)))
+        }
+        return best / palmScale
+    }
+
     /// 엄지와 검지 사이의 정규화된 거리 비율
     var pinchRatio: CGFloat? {
         guard let idx = indexTip, let thm = thumbTip else { return nil }

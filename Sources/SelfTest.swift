@@ -8,12 +8,13 @@ enum SelfTestRunner {
     static func makeHand(
         timestamp: CFAbsoluteTime,
         indexTip: CGPoint = CGPoint(x: 0.50, y: 0.65),
-        thumbTip: CGPoint = CGPoint(x: 0.40, y: 0.50),
+        thumbTip: CGPoint = CGPoint(x: 0.34, y: 0.46),  // L자로 벌린 엄지
         middleTip: CGPoint = CGPoint(x: 0.54, y: 0.42),
         ringCurled: Bool = false,
         littleCurled: Bool = false,
         middleExtended: Bool = false,
-        includeWrist: Bool = true
+        includeWrist: Bool = true,
+        offset: CGVector = .zero  // 손 전체 평행 이동 (조이스틱 스크롤 테스트용)
     ) -> HandPoseData {
         var hand = HandPoseData(timestamp: timestamp, aspectRatio: 4.0 / 3.0)
         let wrist = CGPoint(x: 0.50, y: 0.20)
@@ -65,7 +66,18 @@ enum SelfTestRunner {
             hand.points[.littleTip] = CGPoint(x: 0.58, y: 0.54)
         }
 
+        if offset != .zero {
+            for (joint, p) in hand.points {
+                hand.points[joint] = CGPoint(x: p.x + offset.dx, y: p.y + offset.dy)
+            }
+        }
         return hand
+    }
+
+    /// 엄지 끝을 검지 옆면(MCP~Tip 중간)에 붙인 손
+    static func touchingHand(timestamp: CFAbsoluteTime, indexTip: CGPoint = CGPoint(x: 0.50, y: 0.65)) -> HandPoseData {
+        let side = CGPoint(x: (0.46 + indexTip.x) * 0.5 - 0.01, y: (0.38 + indexTip.y) * 0.5)
+        return makeHand(timestamp: timestamp, indexTip: indexTip, thumbTip: side)
     }
 
     static func runAll() -> Int32 {
@@ -109,118 +121,97 @@ enum SelfTestRunner {
             try assertTrue(curledNoWrist.lowerFingerCurlRatio < 0.45, "손목 잘렸을 때 접힘 비율(\(curledNoWrist.lowerFingerCurlRatio))이 0.45보다 작아야 함")
         }
 
-        // 2. 하이퍼링크 핀치 클릭 검증 (손가락 오므릴 때 발생하는 50px 이상 검지 흔들림 속에서도 정확한 호버 좌표 클릭 및 드래그 오작동 차단)
-        check("2. 하이퍼링크 엄지+검지 핀치 클릭 (검지 흔들림 롤백 & 드래그 오판 방지)") {
+        func count(_ events: [EmittedMouseEvent], _ match: (EmittedMouseEvent.Kind) -> Bool) -> Int {
+            events.filter { match($0.kind) }.count
+        }
+        let isDown: (EmittedMouseEvent.Kind) -> Bool = { if case .leftDown = $0 { return true }; return false }
+        let isUp: (EmittedMouseEvent.Kind) -> Bool = { if case .leftUp = $0 { return true }; return false }
+        let isDrag: (EmittedMouseEvent.Kind) -> Bool = { if case .leftDragged = $0 { return true }; return false }
+
+        // 2. 하이퍼링크 엄지 붙이기 클릭 (엄지가 검지를 밀어 끝이 흔들려도 호버 좌표에서 클릭, 드래그 오판 없음)
+        check("2. 하이퍼링크 엄지 붙이기 클릭 (검지 흔들림 롤백 & 드래그 오판 방지)") {
             let engine = GestureEngine(startInterpolator: false)
             engine.suppressSystemEvents = true
             var events: [EmittedMouseEvent] = []
             engine.onEventEmitted = { events.append($0) }
 
             var t: CFAbsoluteTime = 100.0
-            // (a) 0.4초 동안 하이퍼링크 위치(0.50, 0.65) 위에서 안정적으로 포인팅 호버
+            // (a) 0.4초 동안 하이퍼링크 위치(0.50, 0.65) 위에서 엄지를 편 채 호버
             for _ in 0..<24 {
                 t += 1.0 / 60.0
-                let h = makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.65), thumbTip: CGPoint(x: 0.36, y: 0.48))
-                engine.process(hand: h)
+                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.65)))
                 engine.tick(nowOverride: t)
             }
             let hoverPoint = events.last?.point ?? .zero
             events.removeAll()
 
-            // (b) 핀치 접근 프레임 (엄지와 검지가 가까워지며 검지 끝이 아래로 살짝 끌려 내려감)
+            // (b) 엄지가 검지로 다가오는 프레임 (검지 끝이 살짝 밀림)
             t += 1.0 / 60.0
-            let approachHand = makeHand(timestamp: t, indexTip: CGPoint(x: 0.49, y: 0.62), thumbTip: CGPoint(x: 0.42, y: 0.55))
-            engine.process(hand: approachHand)
+            engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.49, y: 0.63), thumbTip: CGPoint(x: 0.41, y: 0.50)))
             engine.tick(nowOverride: t)
 
-            // (c) 핀치 완료 및 0.28초 유지 (검지 끝이 0.65 -> 0.59로 크게 흔들렸지만 드래그로 오판하면 안 됨!)
+            // (c) 엄지 붙임 0.28초 유지 (검지 끝이 0.65 -> 0.61로 흔들림)
             for i in 0..<16 {
                 t += 1.0 / 60.0
-                let jitterX = 0.48 + CGFloat(i % 3) * 0.003
-                let jitterY = 0.59 - CGFloat(i % 2) * 0.004
-                let pinchedHand = makeHand(timestamp: t, indexTip: CGPoint(x: jitterX, y: jitterY), thumbTip: CGPoint(x: jitterX - 0.015, y: jitterY - 0.015))
-                engine.process(hand: pinchedHand)
+                let jx = 0.48 + CGFloat(i % 3) * 0.003
+                let jy = 0.61 - CGFloat(i % 2) * 0.004
+                engine.process(hand: touchingHand(timestamp: t, indexTip: CGPoint(x: jx, y: jy)))
                 engine.tick(nowOverride: t)
             }
 
-            // (d) 핀치 해제
+            // (d) 엄지 벌림
             t += 1.0 / 60.0
-            let releaseHand = makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.65), thumbTip: CGPoint(x: 0.36, y: 0.48))
-            engine.process(hand: releaseHand)
+            engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.65)))
             engine.tick(nowOverride: t)
 
-            let dragEvents = events.filter {
-                if case .leftDragged = $0.kind { return true }
-                return false
-            }
-            let downEvents = events.filter {
-                if case .leftDown = $0.kind { return true }
-                return false
-            }
-            let upEvents = events.filter {
-                if case .leftUp = $0.kind { return true }
-                return false
-            }
-
-            try assertTrue(dragEvents.isEmpty, "핀치 클릭 중 leftDragged 이벤트가 발생하면 안 됨 (발생 수: \(dragEvents.count))")
-            try assertTrue(downEvents.count == 1 && upEvents.count == 1, "leftDown 1회, leftUp 1회가 정확히 발생해야 함 (down: \(downEvents.count), up: \(upEvents.count))")
-            let downPt = downEvents[0].point
-            let upPt = upEvents[0].point
-            try assertTrue(hypot(downPt.x - upPt.x, downPt.y - upPt.y) < 0.01, "mouseDown과 mouseUp 좌표가 완전히 일치해야 함")
-            let driftFromHover = hypot(downPt.x - hoverPoint.x, downPt.y - hoverPoint.y)
-            try assertTrue(driftFromHover < 5.0, "핀치 시 검지가 흔들려도 원래 호버하던 하이퍼링크 좌표에서 클릭되어야 함 (오차: \(driftFromHover)px)")
+            let downs = events.filter { isDown($0.kind) }
+            let ups = events.filter { isUp($0.kind) }
+            try assertTrue(count(events, isDrag) == 0, "엄지 붙이기 클릭 중 leftDragged가 발생하면 안 됨")
+            try assertTrue(downs.count == 1 && ups.count == 1, "leftDown 1회, leftUp 1회여야 함 (down: \(downs.count), up: \(ups.count))")
+            let drift = hypot(downs[0].point.x - hoverPoint.x, downs[0].point.y - hoverPoint.y)
+            try assertTrue(hypot(downs[0].point.x - ups[0].point.x, downs[0].point.y - ups[0].point.y) < 0.01, "down/up 좌표가 일치해야 함")
+            try assertTrue(drift < 5.0, "원래 호버 좌표에서 클릭되어야 함 (오차: \(drift)px)")
         }
 
-        // 3. 처음부터 👆 자세(약지/새끼 접힘)로 진입 시 오클릭 방지 및 약지 접기 클릭 검증
-        check("3. 👆 자세 초기 진입 시 오클릭 방지 및 약지+새끼 접기 클릭") {
+        // 3. 처음부터 엄지를 붙인 채 진입하면 클릭 안 됨, 엄지를 벌린 뒤 붙였다 떼면 클릭
+        check("3. 엄지 붙인 채 진입 시 오클릭 방지 및 무장 후 클릭") {
             let engine = GestureEngine(startInterpolator: false)
             engine.suppressSystemEvents = true
             var events: [EmittedMouseEvent] = []
             engine.onEventEmitted = { events.append($0) }
 
             var t: CFAbsoluteTime = 200.0
-            // (a) 처음부터 약지/새끼가 접힌 상태(👆)로 10프레임 이동 -> 클릭이 발동되면 안 됨!
             for _ in 0..<10 {
                 t += 1.0 / 60.0
-                let h = makeHand(timestamp: t, ringCurled: true, littleCurled: true)
-                engine.process(hand: h)
+                engine.process(hand: touchingHand(timestamp: t))
                 engine.tick(nowOverride: t)
             }
-            try assertTrue(!engine.isPressed, "손이 처음부터 약지/새끼를 접은 채 진입했을 때는 자동 클릭이 걸리면 안 됨")
+            try assertTrue(!engine.isPressed, "엄지를 붙인 채 진입했을 때는 클릭이 걸리면 안 됨")
 
-            // (b) 손가락을 펴서 무장(isCurlArmed = true) 후 다시 접었다 펴기 -> 정상 클릭 발동!
             for _ in 0..<10 {
                 t += 1.0 / 60.0
-                let openHand = makeHand(timestamp: t, ringCurled: false, littleCurled: false)
-                engine.process(hand: openHand)
+                engine.process(hand: makeHand(timestamp: t))
                 engine.tick(nowOverride: t)
             }
             events.removeAll()
-
             for _ in 0..<8 {
                 t += 1.0 / 60.0
-                let curledHand = makeHand(timestamp: t, ringCurled: true, littleCurled: true)
-                engine.process(hand: curledHand)
+                engine.process(hand: touchingHand(timestamp: t))
                 engine.tick(nowOverride: t)
             }
             t += 1.0 / 60.0
-            let releaseHand = makeHand(timestamp: t, ringCurled: false, littleCurled: false)
-            engine.process(hand: releaseHand)
+            engine.process(hand: makeHand(timestamp: t))
 
-            let downCount = events.filter { if case .leftDown = $0.kind { return true }; return false }.count
-            let upCount = events.filter { if case .leftUp = $0.kind { return true }; return false }.count
-            try assertTrue(downCount == 1 && upCount == 1, "약지+새끼 접기 후 펴기 시 정확히 1회 클릭되어야 함")
+            try assertTrue(count(events, isDown) == 1 && count(events, isUp) == 1, "엄지 붙였다 떼면 정확히 1회 클릭되어야 함")
         }
 
-        // 4. 연속 핀치 시 더블클릭(clickState == 2) 발생 검증
+        // 4. 연속 엄지 붙이기 시 더블클릭(clickState == 2)
         check("4. 더블클릭 (clickState == 1 -> 2) 정상 주입 검증") {
             let engine = GestureEngine(startInterpolator: false)
             engine.suppressSystemEvents = true
             var downClicks: [Int] = []
             engine.onEventEmitted = { ev in
-                if case let .leftDown(clicks) = ev.kind {
-                    downClicks.append(clicks)
-                }
+                if case let .leftDown(clicks) = ev.kind { downClicks.append(clicks) }
             }
 
             var t: CFAbsoluteTime = 300.0
@@ -229,28 +220,15 @@ enum SelfTestRunner {
                 engine.process(hand: makeHand(timestamp: t))
                 engine.tick(nowOverride: t)
             }
-            // 첫 번째 클릭
-            for _ in 0..<5 {
-                t += 1.0 / 60.0
-                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.64), thumbTip: CGPoint(x: 0.49, y: 0.63)))
+            for _ in 0..<2 {
+                for _ in 0..<5 { t += 1.0 / 60.0; engine.process(hand: touchingHand(timestamp: t)) }
+                for _ in 0..<6 { t += 1.0 / 60.0; engine.process(hand: makeHand(timestamp: t)) }
             }
-            for _ in 0..<6 {
-                t += 1.0 / 60.0
-                engine.process(hand: makeHand(timestamp: t))
-            }
-            // 두 번째 클릭 (0.2초 이내)
-            for _ in 0..<5 {
-                t += 1.0 / 60.0
-                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.64), thumbTip: CGPoint(x: 0.49, y: 0.63)))
-            }
-            t += 1.0 / 60.0
-            engine.process(hand: makeHand(timestamp: t))
-
             try assertTrue(downClicks == [1, 2], "연속 클릭 시 clickState가 [1, 2]여야 함 (실제: \(downClicks))")
         }
 
-        // 5. 의도적 홀드 + 이동 시 드래그(leftMouseDragged) 정상 작동 검증
-        check("5. 의도적 길게 누르고 이동 시 드래그 앤 드롭 검증") {
+        // 5. 엄지를 붙인 채 이동하면 드래그
+        check("5. 엄지 붙이고 이동 시 드래그 앤 드롭 검증") {
             let engine = GestureEngine(startInterpolator: false)
             engine.suppressSystemEvents = true
             var events: [EmittedMouseEvent] = []
@@ -259,97 +237,119 @@ enum SelfTestRunner {
             var t: CFAbsoluteTime = 400.0
             for _ in 0..<10 {
                 t += 1.0 / 60.0
-                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.50), thumbTip: CGPoint(x: 0.35, y: 0.40)))
+                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.50)))
                 engine.tick(nowOverride: t)
             }
             events.removeAll()
 
-            // 핀치한 채로 0.5초 동안 X: 0.50 -> 0.35로 크게 이동
-            for i in 0..<30 {
+            for i in 0..<40 {
                 t += 1.0 / 60.0
                 let x = 0.50 - CGFloat(i) * 0.005
-                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: x, y: 0.50), thumbTip: CGPoint(x: x - 0.01, y: 0.49)))
+                engine.process(hand: touchingHand(timestamp: t, indexTip: CGPoint(x: x, y: 0.50)))
                 engine.tick(nowOverride: t)
             }
             t += 1.0 / 60.0
-            engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.35, y: 0.50), thumbTip: CGPoint(x: 0.25, y: 0.40)))
+            // 합성 손은 MCP가 고정이라, 엄지도 검지 끝 기준으로 L자 위치에 둔다
+            engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.30, y: 0.50), thumbTip: CGPoint(x: 0.14, y: 0.31)))
 
-            let dragCount = events.filter { if case .leftDragged = $0.kind { return true }; return false }.count
-            let downCount = events.filter { if case .leftDown = $0.kind { return true }; return false }.count
-            let upCount = events.filter { if case .leftUp = $0.kind { return true }; return false }.count
-
-            try assertTrue(downCount == 1 && dragCount > 5 && upCount == 1, "드래그 시 leftDown(1) -> leftDragged(\(dragCount)) -> leftUp(1)이 순서대로 발생해야 함")
+            let drags = count(events, isDrag)
+            try assertTrue(count(events, isDown) == 1 && drags > 5 && count(events, isUp) == 1,
+                           "드래그 시 leftDown(1) -> leftDragged(\(drags)) -> leftUp(1)이어야 함")
         }
 
-        // 6. 두 손가락 저속·고속 스크롤 (데드존 증발 방지 & 약지 접힘 좌클릭 간섭 차단)
-        check("6. 두 손가락(검지+중지) 부드러운 픽셀 스크롤 및 좌클릭 오작동 차단") {
+        // 6. 두 손가락 조이스틱 스크롤: 기준점에서는 정지, 손을 올리면 위로, 오른쪽으로 옮기면 가로 스크롤, 엄지가 붙어도 클릭 없음
+        check("6. 조이스틱 스크롤 (정지 구간·세로·가로) 및 좌클릭 오작동 차단") {
             let engine = GestureEngine(startInterpolator: false)
             engine.suppressSystemEvents = true
-            var scrollPixels: Int32 = 0
-            var scrollEventCount = 0
+            var sumX: Int32 = 0
+            var sumY: Int32 = 0
             var accidentalClicks = 0
+            var phases: [String] = []
             engine.onEventEmitted = { ev in
                 switch ev.kind {
-                case let .scroll(dy):
-                    scrollPixels += dy
-                    scrollEventCount += 1
+                case let .scroll(dx, dy):
+                    sumX += dx
+                    sumY += dy
+                case .scrollBegan:
+                    phases.append("began")
+                case .scrollEnded:
+                    phases.append("ended")
                 case .leftDown, .leftDragged:
                     accidentalClicks += 1
                 default:
                     break
                 }
             }
-
+            // 검지+중지 붙여 펴고 약지+새끼 접고 엄지는 검지 옆에 붙인 스크롤 자세
+            func scrollHand(_ t: CFAbsoluteTime, _ offset: CGVector) -> HandPoseData {
+                makeHand(timestamp: t, indexTip: CGPoint(x: 0.48, y: 0.62), thumbTip: CGPoint(x: 0.46, y: 0.50),
+                         middleTip: CGPoint(x: 0.52, y: 0.62), ringCurled: true, littleCurled: true,
+                         middleExtended: true, offset: offset)
+            }
             var t: CFAbsoluteTime = 500.0
-            // 먼저 일반 포인팅으로 약지/새끼 무장 상태(isCurlArmed = true)를 만듦
-            for _ in 0..<5 {
-                t += 1.0 / 60.0
-                engine.process(hand: makeHand(timestamp: t, ringCurled: false, littleCurled: false))
+            func run(_ frames: Int, _ offset: CGVector) {
+                for _ in 0..<frames {
+                    t += 1.0 / 30.0
+                    engine.process(hand: scrollHand(t, offset))
+                    // 240Hz 보간 스레드 대신 프레임 사이 8회 tick
+                    for k in 1...8 { engine.tick(nowOverride: t + Double(k) / 240.0) }
+                }
             }
+            for _ in 0..<5 { t += 1.0 / 30.0; engine.process(hand: makeHand(timestamp: t)) }  // 클릭 무장
 
-            // 이제 검지+중지를 나란히 붙여서 펴고(x 간격 0.04, 높이 동일) 약지+새끼는 접은 상태에서 위로 25프레임 이동
-            for i in 0..<25 {
-                t += 1.0 / 60.0
-                let y = 0.56 + CGFloat(i) * 0.0025
-                let scrollHand = makeHand(
-                    timestamp: t,
-                    indexTip: CGPoint(x: 0.48, y: y),
-                    thumbTip: CGPoint(x: 0.34, y: 0.38),
-                    middleTip: CGPoint(x: 0.52, y: y),
-                    ringCurled: true,
-                    littleCurled: true,
-                    middleExtended: true
-                )
-                engine.process(hand: scrollHand)
+            run(15, .zero)
+            try assertTrue(engine.currentState == .scrolling, "스크롤 자세에서는 .scrolling 상태여야 함 (실제: \(engine.currentState))")
+            try assertTrue(sumX == 0 && sumY == 0, "기준점에 손을 두면 스크롤이 없어야 함 (x: \(sumX), y: \(sumY))")
+
+            run(30, CGVector(dx: 0, dy: 0.15))  // 손을 위로 (Vision y는 위가 +)
+            try assertTrue(sumY > 50 && sumX == 0, "손을 올리면 위로만 스크롤되어야 함 (x: \(sumX), y: \(sumY))")
+
+            let yBefore = sumY
+            run(30, CGVector(dx: -0.15, dy: 0))  // 카메라 영상 x-는 사용자 기준 오른쪽
+            try assertTrue(sumX < -50, "손을 오른쪽으로 옮기면 가로 스크롤(wheel2 음수)이 나와야 함 (x: \(sumX))")
+            try assertTrue(abs(sumY - yBefore) < 60, "가로 이동 중 세로 스크롤은 거의 없어야 함 (Δy: \(sumY - yBefore))")
+
+            // 스크롤 자세를 풀고 엄지를 벌려도 클릭이 나가면 안 됨 (유예 0.06초를 넘기도록 3프레임)
+            for _ in 0..<3 {
+                t += 1.0 / 30.0
+                engine.process(hand: makeHand(timestamp: t))
             }
-
-            try assertTrue(accidentalClicks == 0, "두 손가락 스크롤 중 약지/새끼가 접혀 있어도 좌클릭이 발생하면 안 됨 (발생: \(accidentalClicks))")
-            try assertTrue(scrollEventCount >= 8 && scrollPixels > 90, "저속 이동에서도 데드존 없이 픽셀 스크롤이 누적 배출되어야 함 (이벤트: \(scrollEventCount)회, 총 픽셀: \(scrollPixels))")
+            try assertTrue(phases == ["began", "ended"], "트랙패드처럼 began 1회 → ended 1회여야 함 (실제: \(phases))")
+            try assertTrue(accidentalClicks == 0, "스크롤 중 엄지가 검지에 붙어 있어도 좌클릭이 발생하면 안 됨 (발생: \(accidentalClicks))")
         }
 
-        // 7. 우클릭 논블로킹(Non-blocking) 속도 검증
-        check("7. 엄지+중지 우클릭 즉시 응답 (스레드 블로킹 제거 검증)") {
+        // 6b. 조이스틱 속도 곡선
+        check("6b. 조이스틱 속도 곡선 (정지 구간·증가·상한·주축 스냅)") {
+            func v(_ x: CGFloat, _ y: CGFloat) -> CGVector {
+                GestureEngine.joystickScrollVelocity(offset: CGVector(dx: x, dy: y), deadZone: 0.25, gain: 1600, maxSpeed: 4000)
+            }
+            try assertTrue(v(0, 0.2) == .zero, "정지 구간 안에서는 0이어야 함")
+            try assertTrue(v(0, 0.5).dy > 0 && v(0, -0.5).dy < 0, "위는 +, 아래는 -")
+            try assertTrue(v(0, 1.0).dy > v(0, 0.5).dy, "멀수록 빨라야 함")
+            try assertTrue(v(0, 10).dy == 4000, "상한 4000px/s")
+            try assertTrue(v(0.2, 1.0).dx == 0, "세로가 지배적이면 가로 성분은 스냅되어 0")
+            try assertTrue(v(1.0, 0).dx < 0 && v(1.0, 0).dy == 0, "오른쪽은 wheel2 음수")
+        }
+
+        // 7. 약지+새끼 접기는 더 이상 클릭이 아님
+        check("7. 약지·새끼 접기로는 클릭되지 않음") {
             let engine = GestureEngine(startInterpolator: false)
             engine.suppressSystemEvents = true
-            var rightClicks = 0
-            engine.onEventEmitted = { ev in
-                if case .rightUp = ev.kind { rightClicks += 1 }
+            var t: CFAbsoluteTime = 600.0
+            for _ in 0..<10 { t += 1.0 / 60.0; engine.process(hand: makeHand(timestamp: t)) }
+            for _ in 0..<10 {
+                t += 1.0 / 60.0
+                engine.process(hand: makeHand(timestamp: t, ringCurled: true, littleCurled: true))
             }
+            try assertTrue(!engine.isPressed, "약지+새끼 접기로 눌리면 안 됨")
+        }
 
-            let t0 = CFAbsoluteTimeGetCurrent()
-            let rightClickHand = makeHand(
-                timestamp: 600.0,
-                indexTip: CGPoint(x: 0.46, y: 0.65),
-                thumbTip: CGPoint(x: 0.50, y: 0.45),
-                middleTip: CGPoint(x: 0.51, y: 0.46),
-                ringCurled: false,
-                littleCurled: false
-            )
-            engine.process(hand: rightClickHand)
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
-
-            try assertTrue(rightClicks == 1, "우클릭 이벤트가 1회 발생해야 함")
-            try assertTrue(elapsedMs < 10.0, "우클릭 처리가 캡처 스레드를 블로킹하지 않아야 함 (소요: \(String(format: "%.2f", elapsedMs))ms)")
+        // 7b. 엄지-검지 붙임 비율 기하 검증
+        check("7b. 엄지-검지 붙임 비율 (L자 벌림 vs 옆면 붙임)") {
+            let open = makeHand(timestamp: 1.0).thumbIndexRatio ?? 0
+            let touching = touchingHand(timestamp: 1.0).thumbIndexRatio ?? 1
+            try assertTrue(open > 0.55, "L자로 벌린 엄지 비율(\(open))이 0.55보다 커야 함")
+            try assertTrue(touching < 0.15, "검지에 붙인 엄지 비율(\(touching))이 0.15보다 작아야 함")
         }
 
         // 8. 멀티스레드 동시성 스트레스 테스트 & Fail-safe 워치독 검증
@@ -364,8 +364,8 @@ enum SelfTestRunner {
             for i in 0..<500 {
                 group.enter()
                 q1.async {
-                    let h = makeHand(timestamp: CFAbsoluteTime(700 + Double(i) * 0.01), ringCurled: i % 2 == 0, littleCurled: i % 2 == 0)
-                    engine.process(hand: h)
+                    let ts = CFAbsoluteTime(700 + Double(i) * 0.01)
+                    engine.process(hand: i % 2 == 0 ? touchingHand(timestamp: ts) : makeHand(timestamp: ts))
                     group.leave()
                 }
                 group.enter()
@@ -382,11 +382,12 @@ enum SelfTestRunner {
             engine.releaseAll()
             engine.isEnabled = true
 
-            // 워치독 테스트: 핀치 누름 후 2.0초 동안 프레임이 끊겼을 때 자동 해제되는지 확인
-            let pinchHand = makeHand(timestamp: 900.0, indexTip: CGPoint(x: 0.50, y: 0.60), thumbTip: CGPoint(x: 0.49, y: 0.59))
-            engine.process(hand: pinchHand)
-            try assertTrue(engine.isPressed, "핀치 직후 isPressed == true여야 함")
-            engine.tick(nowOverride: 902.0)
+            // 워치독: 엄지 붙이기 누름 후 2.0초 동안 프레임이 끊기면 자동 해제
+            var t: CFAbsoluteTime = 899.7
+            for _ in 0..<15 { t += 1.0 / 60.0; engine.process(hand: makeHand(timestamp: t)) }  // 무장 (0.12초 이상)
+            for _ in 0..<5 { t += 1.0 / 60.0; engine.process(hand: touchingHand(timestamp: t)) }  // 확정 (0.05초 이상)
+            try assertTrue(engine.isPressed, "엄지를 붙여 확정된 뒤 isPressed == true여야 함")
+            engine.tick(nowOverride: t + 2.0)
             try assertTrue(!engine.isPressed, "1.2초 이상 프레임 입력이 끊기면 워치독이 자동으로 isPressed를 해제해야 함")
         }
 
@@ -458,7 +459,7 @@ enum SelfTestRunner {
                 let singleFingerHand = makeHand(
                     timestamp: t,
                     indexTip: CGPoint(x: 0.45 + dx, y: 0.58 + dy),
-                    thumbTip: CGPoint(x: 0.35 + dx, y: 0.42 + dy),
+                    thumbTip: CGPoint(x: 0.30, y: 0.42 + dy),  // L자 엄지 유지 (합성 손은 MCP 고정)
                     middleTip: CGPoint(x: 0.49 + dx, y: 0.49 + dy),
                     ringCurled: true,
                     littleCurled: true,
@@ -488,52 +489,96 @@ enum SelfTestRunner {
                            "후보가 없으면 nil")
         }
 
-        // 12. 우클릭 재무장: 붙인 채 1초 유지해도 1회, 뗐다 다시 붙이면 2회
-        check("12. 우클릭 재무장 (손가락을 떼야 다음 우클릭)") {
+        // 12. 신뢰도 게이트: 엄지 끝 신뢰도가 낮으면 클릭으로 진입하지 않음
+        check("12. 저신뢰 엄지 끝 붙이기 무시") {
             let engine = GestureEngine(startInterpolator: false)
             engine.suppressSystemEvents = true
-            var rightClicks = 0
-            engine.onEventEmitted = { ev in
-                if case .rightUp = ev.kind { rightClicks += 1 }
-            }
-            func rightPinch(_ t: CFAbsoluteTime) -> HandPoseData {
-                makeHand(timestamp: t, indexTip: CGPoint(x: 0.46, y: 0.65),
-                         thumbTip: CGPoint(x: 0.50, y: 0.45), middleTip: CGPoint(x: 0.51, y: 0.46))
-            }
-            var t: CFAbsoluteTime = 900.0
-            for _ in 0..<60 { t += 1.0 / 60.0; engine.process(hand: rightPinch(t)) }
-            try assertTrue(rightClicks == 1, "붙인 채 유지 시 우클릭 1회여야 함 (발생: \(rightClicks))")
+            var t: CFAbsoluteTime = 1100.0
+            for _ in 0..<10 { t += 1.0 / 60.0; engine.process(hand: makeHand(timestamp: t)) }
 
-            for _ in 0..<5 {
-                t += 1.0 / 60.0
-                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.46, y: 0.65),
-                                              thumbTip: CGPoint(x: 0.36, y: 0.45), middleTip: CGPoint(x: 0.54, y: 0.42)))
-            }
             t += 1.0 / 60.0
-            engine.process(hand: rightPinch(t))
-            try assertTrue(rightClicks == 2, "뗐다 다시 붙이면 우클릭 2회여야 함 (발생: \(rightClicks))")
-        }
-
-        // 13. 신뢰도 게이트: 손끝 신뢰도가 낮은 핀치는 클릭으로 진입하지 않음
-        check("13. 저신뢰 손끝 핀치 무시") {
-            let engine = GestureEngine(startInterpolator: false)
-            engine.suppressSystemEvents = true
-            engine.clickTriggerMode = .pinch
-            var t: CFAbsoluteTime = 1000.0
-            for _ in 0..<10 {
-                t += 1.0 / 60.0
-                engine.process(hand: makeHand(timestamp: t, indexTip: CGPoint(x: 0.50, y: 0.65), thumbTip: CGPoint(x: 0.36, y: 0.48)))
-            }
-            var blurry = makeHand(timestamp: t + 1.0 / 60.0, indexTip: CGPoint(x: 0.50, y: 0.60), thumbTip: CGPoint(x: 0.49, y: 0.59))
-            blurry.confidences[.indexTip] = 0.30
+            var blurry = touchingHand(timestamp: t)
+            blurry.confidences[.thumbTip] = 0.30
             engine.process(hand: blurry)
-            try assertTrue(!engine.isPressed, "신뢰도 0.30 손끝으로는 핀치가 눌리면 안 됨")
+            try assertTrue(!engine.isPressed, "신뢰도 0.30 엄지 끝으로는 눌리면 안 됨")
 
             var clear = blurry
-            clear.timestamp += 1.0 / 60.0
-            clear.confidences[.indexTip] = 0.90
-            engine.process(hand: clear)
-            try assertTrue(engine.isPressed, "신뢰도 0.90이면 핀치가 눌려야 함")
+            clear.confidences[.thumbTip] = 0.90
+            for _ in 0..<5 {
+                clear.timestamp += 1.0 / 60.0
+                engine.process(hand: clear)
+            }
+            try assertTrue(engine.isPressed, "신뢰도 0.90이 이어지면 눌려야 함")
+        }
+
+        // 13. 시간 기반 무장: 30fps든 60fps든 엄지를 벌린 지 0.12초가 지나야 무장
+        check("13. 시간 기반 무장 (30fps·60fps 동일 체감 시간)") {
+            for fps in [30.0, 60.0] {
+                let engine = GestureEngine(startInterpolator: false)
+                engine.suppressSystemEvents = true
+                var t: CFAbsoluteTime = 1200.0
+                // 0.08초만 벌렸다가 바로 붙이면 무장 전이라 클릭 안 됨
+                for _ in 0..<Int(0.08 * fps) { t += 1.0 / fps; engine.process(hand: makeHand(timestamp: t)) }
+                for _ in 0..<Int(0.2 * fps) { t += 1.0 / fps; engine.process(hand: touchingHand(timestamp: t)) }
+                try assertTrue(!engine.isPressed, "\(Int(fps))fps: 0.08초만 벌렸으면 무장 전이라 눌리면 안 됨")
+                // 0.2초 벌린 뒤 붙이면 클릭
+                for _ in 0..<Int(0.2 * fps) { t += 1.0 / fps; engine.process(hand: makeHand(timestamp: t)) }
+                for _ in 0..<Int(0.1 * fps) { t += 1.0 / fps; engine.process(hand: touchingHand(timestamp: t)) }
+                try assertTrue(engine.isPressed, "\(Int(fps))fps: 0.2초 벌린 뒤 붙이면 눌려야 함")
+            }
+        }
+
+        // 14. 재앵커: 손을 기준점에서 옮긴 채 스크롤을 끝내도 커서가 손 위치로 점프하지 않음
+        check("14. 스크롤 종료 후 커서 점프 없음 (재앵커)") {
+            let engine = GestureEngine(startInterpolator: false)
+            engine.suppressSystemEvents = true
+            var lastMove: CGPoint?
+            engine.onEventEmitted = { ev in
+                if case .move = ev.kind { lastMove = ev.point }
+            }
+            var t: CFAbsoluteTime = 1300.0
+            func frame(_ h: HandPoseData) {
+                engine.process(hand: h)
+                for k in 1...8 { engine.tick(nowOverride: t + Double(k) / 240.0) }
+            }
+            func scrollPose(_ off: CGVector) -> HandPoseData {
+                makeHand(timestamp: t, indexTip: CGPoint(x: 0.48, y: 0.62), thumbTip: CGPoint(x: 0.34, y: 0.46),
+                         middleTip: CGPoint(x: 0.52, y: 0.62), ringCurled: true, littleCurled: true,
+                         middleExtended: true, offset: off)
+            }
+            for _ in 0..<30 { t += 1.0 / 30.0; frame(makeHand(timestamp: t, indexTip: CGPoint(x: 0.48, y: 0.62))) }
+            // 자세를 먼저 잡고(스크롤 확정), 그다음 손을 위로 옮겨 스크롤
+            for _ in 0..<8 { t += 1.0 / 30.0; frame(scrollPose(.zero)) }
+            guard let before = lastMove else { throw TestFailure("호버 중 커서 이동 이벤트가 없음") }
+            let up = CGVector(dx: 0, dy: 0.15)
+            for _ in 0..<20 { t += 1.0 / 30.0; frame(scrollPose(up)) }
+            try assertTrue(engine.currentState == .scrolling, "스크롤 중이어야 함")
+            // 손을 위로 옮긴 채 스크롤 자세를 풀고 포인팅
+            // (검지 끝은 스크롤 자세 때와 같은 자리, 중지만 접음 → 손 자체는 움직이지 않음)
+            for _ in 0..<10 {
+                t += 1.0 / 30.0
+                frame(makeHand(timestamp: t, indexTip: CGPoint(x: 0.48, y: 0.62), offset: up))
+            }
+            let after = lastMove ?? before
+            let jump = hypot(after.x - before.x, after.y - before.y)
+            try assertTrue(jump < 15, "스크롤 후 커서는 원래 자리 근처여야 함 (이동: \(Int(jump))px)")
+        }
+
+        // 15. 랜드마크 기록 형식 왕복 + 엄지 보정 계산
+        check("15. 기록 JSONL 왕복 및 엄지 보정 임계값") {
+            let h = touchingHand(timestamp: 42.5)
+            guard let back = LandmarkCodec.decode(LandmarkCodec.encode(h, t: 42.5)), let hb = back.hand else {
+                throw TestFailure("디코드 실패")
+            }
+            try assertTrue(back.t == 42.5 && hb.points.count == h.points.count, "시각·관절 수가 같아야 함")
+            try assertTrue(abs((hb.thumbIndexRatio ?? 9) - (h.thumbIndexRatio ?? 0)) < 1e-6, "엄지 비율이 같아야 함")
+            try assertTrue(LandmarkCodec.decode(LandmarkCodec.encode(nil, t: 1.0))?.hand == nil, "손 없음 프레임 왕복")
+
+            let samples = (0..<40).map { i -> CGFloat in i % 2 == 0 ? 0.10 : 0.80 }
+            guard let th = ThumbCalibration.thresholds(from: samples) else { throw TestFailure("보정 실패") }
+            try assertTrue(th.enter < th.exit && th.exit < th.approach, "누름 < 뗌 < 접근 순서")
+            try assertTrue(abs(th.enter - 0.345) < 0.01, "누름 = 붙임 + 35% (실제 \(th.enter))")
+            try assertTrue(ThumbCalibration.thresholds(from: Array(repeating: 0.5, count: 40)) == nil, "변화가 없으면 보정 실패")
         }
 
         print("====================================================")

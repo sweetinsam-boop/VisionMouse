@@ -2,12 +2,6 @@ import Foundation
 import CoreGraphics
 import AppKit
 
-enum ClickTriggerMode: String, CaseIterable {
-    case both = "둘 다 허용 (약지 접기 + 엄지·검지 핀치, 권장)"
-    case fingerCurl = "약지+새끼 접기 전용 (커서 흔들림 제로)"
-    case pinch = "엄지+검지 핀치 전용 (기존 꼬집기)"
-}
-
 enum SensitivityLevel: String, CaseIterable {
     case veryHigh = "초고감도 (손가락만 살짝)"
     case high = "고감도 (작은 손 움직임)"
@@ -18,10 +12,8 @@ enum SensitivityLevel: String, CaseIterable {
 enum GestureState: String {
     case idle = "대기 중"
     case pointing = "포인팅"
-    case pinching = "클릭 중 (핀치)"
-    case fingerCurled = "클릭 중 (약지 접음)"
+    case thumbTouching = "클릭 중 (엄지 붙임)"
     case dragging = "드래그 중"
-    case rightClicking = "우클릭"
     case scrolling = "스크롤 중"
     case noHand = "손 감지 안됨"
 }
@@ -32,9 +24,9 @@ struct EmittedMouseEvent {
         case leftDown(clicks: Int)
         case leftUp(clicks: Int)
         case leftDragged(dx: CGFloat, dy: CGFloat)
-        case rightDown
-        case rightUp
-        case scroll(pixelDeltaY: Int32)
+        case scroll(dx: Int32, dy: Int32)
+        case scrollBegan
+        case scrollEnded
     }
     let kind: Kind
     let point: CGPoint
@@ -50,11 +42,10 @@ final class GestureEngine {
 
     /// 자동화 테스트 및 이벤트 검증용 훅 (운영 시 nil)
     var onEventEmitted: ((EmittedMouseEvent) -> Void)?
+    /// 스크롤 진단 로그 훅 (CSV 한 줄씩). nil이면 기록 안 함. lock 안에서 호출되므로 받는 쪽은 비동기로 써야 함.
+    var scrollDebugLog: ((String) -> Void)?
     /// 자동화 테스트 중 실제 OS 커서 이동/클릭 주입을 막고자 할 때 true로 설정
     var suppressSystemEvents: Bool = false
-
-    // 클릭 방식 설정 (기본: 약지 접기 + 엄지·검지 핀치 모두 허용)
-    var clickTriggerMode: ClickTriggerMode = .both
 
     // 포인터 감도 설정 (기본: 보통)
     var sensitivity: SensitivityLevel = .normal {
@@ -77,33 +68,71 @@ final class GestureEngine {
         return CGRect(x: roiMinX, y: roiMinY, width: roiMaxX - roiMinX, height: roiMaxY - roiMinY)
     }
 
-    // 핀치 임계값 (종횡비 보정된 거리 비율 기준)
-    var pinchThresholdEnter: CGFloat = 0.40
-    var pinchThresholdExit: CGFloat = 0.50
-    var pinchRawDistMax: CGFloat = 0.068
+    // 엄지 붙이기 클릭 임계값 (엄지 끝 ~ 검지 꺾은선 거리 / palmScale; L자로 벌림 ~0.6+, 검지에 붙임 <0.25)
+    // shortcut: 합성 손 기준 초기값, 실제 손 기록(IMPROVEMENTS #10)으로 보정 필요
+    var thumbTouchEnter: CGFloat = 0.25
+    var thumbTouchExit: CGFloat = 0.40
+    var thumbTouchApproach: CGFloat = 0.50
 
-    // 약지+새끼 접기 임계값 (관절 직선도 정규화 척도 기준: 펼침 ~0.80+, 접힘 <0.46)
-    var curlThresholdEnter: CGFloat = 0.46
-    var curlThresholdExit: CGFloat = 0.64
-
-    // 우클릭 임계값
-    var rightPinchThreshold: CGFloat = 0.28
-    /// 우클릭 후 엄지·중지가 이 비율 이상 벌어져야 다음 우클릭 가능 (붙인 채 유지 시 반복 발동 방지)
-    var rightPinchRelease: CGFloat = 0.40
-    private var lastRightClickTime: CFAbsoluteTime = 0.0
-    private var isRightClickArmed = true
-
-    /// 클릭 진입 판정에 필요한 손끝 최소 신뢰도 (모션블러·가림 프레임의 오클릭 방지)
+    /// 클릭 진입 판정에 필요한 엄지 끝 최소 신뢰도 (모션블러·가림 프레임의 오클릭 방지)
     var minClickConfidence: Float = 0.5
+
+    // 시간 기반 확정: 프레임 수만 세면 30fps와 60fps에서 체감 시간이 2배 차이 나므로 "N프레임 그리고 최소 시간"을 함께 요구
+    var armMinDuration: CFAbsoluteTime = 0.12        // 엄지를 벌린 상태가 이만큼 이어져야 클릭 무장
+    var touchConfirmDuration: CFAbsoluteTime = 0.05  // 엄지 붙임이 이만큼 이어져야 누름 (한 프레임짜리 오인식 차단)
+    var scrollConfirmDuration: CFAbsoluteTime = 0.10 // 스크롤 자세가 이만큼 이어져야 스크롤 시작
+    var maxFrameGap: CFAbsoluteTime = 0.12           // 프레임이 이보다 오래 끊기면 진행 중이던 확정 단계를 처음부터
+    private var thumbOpenSince: CFAbsoluteTime = 0.0
+    private var touchStreak = 0
+    private var touchSince: CFAbsoluteTime = 0.0
+    private var scrollMatchSince: CFAbsoluteTime = 0.0
+
+    // 드래그 진입 거리 (손 크기 palmScale 단위; 화면 해상도·감도와 무관)
+    var dragStartDistance: CGFloat = 0.25      // 0.35초 이상 유지 + 이 거리
+    var dragStartDistanceSlow: CGFloat = 0.15  // 0.55초 이상 유지 + 이 거리
+    private var pressStartHand: CGPoint = .zero
+
+    // 재앵커: 스크롤이 끝나거나 손을 다시 잡을 때 커서는 그 자리에 두고 손↔화면 매핑에 오프셋을 둔다.
+    // 오프셋은 손을 움직일수록 0으로 줄어 손과 화면 위치가 영구히 어긋나지 않게 한다.
+    private var cursorOffset: CGVector = .zero
+    private var needsReanchor = false
+    private var lastRawNoOffset: CGPoint?
+    /// 손(화면 환산)이 이 거리(px)만큼 움직이면 오프셋이 1/e로 줄어듦
+    var reanchorDecayDistance: CGFloat = 500.0
+
+    /// true면 커서 Y를 검지 끝 40% + 검지 MCP 60%로 섞어, 엄지가 검지를 밀 때 생기는 커서 흔들림을 줄인다
+    var aimBlendKnuckle: Bool = false
+
+    // HUD 피드백용: 클릭 무장 여부와 엄지가 검지에 다가간 정도(0~1, 누름 중이면 1)
+    private var _clickProgress: CGFloat = 0.0
+    var clickFeedback: (armed: Bool, progress: CGFloat) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (isThumbArmed, _clickProgress)
+    }
 
     // 스크롤 상태 및 서브픽셀 누적기
     private var isScrolling = false
     private var scrollMatchStreak = 0
-    private var lastScrollY: CGFloat?
-    private var scrollRemainderY: CGFloat = 0.0
     private var lastScrollValidTime: CFAbsoluteTime = 0.0
-    private let scrollFilterY = OneEuro(minCutoff: 2.8, beta: 0.08)
-    var scrollGainPixels: CGFloat = 2100.0
+    // 조이스틱 스크롤: 스크롤 자세를 취한 순간의 손 위치가 기준점, 기준점에서 벗어난 방향·거리로 속도 결정
+    private var scrollAnchorHand: CGPoint?
+    private var scrollScale: CGFloat?   // 스크롤 시작 시점의 손 크기 고정 (매 프레임 palmScale 흔들림이 속도로 새지 않게)
+    private var scrollVelocity: CGVector = .zero      // px/s 목표 속도 (dx: 가로 wheel2, dy: 세로 wheel1), 카메라 프레임마다 갱신
+    private var scrollVelocitySmoothed: CGVector = .zero  // 240Hz tick에서 목표 속도로 부드럽게 수렴하는 실제 속도
+    private var scrollGestureActive = false           // 트랙패드처럼 began → changed → ended 단계를 보냈는지
+    /// 목표 속도로 수렴하는 시간 상수 (초). 30fps 속도 계단과 손떨림을 흡수.
+    var scrollEaseTime: CFAbsoluteTime = 0.08
+    private var scrollRemainder: CGVector = .zero
+    private var lastScrollTickTime: CFAbsoluteTime = 0.0
+    private var scrollCursorPoint: CGPoint = .zero
+    private let scrollFilterX = OneEuro(minCutoff: 1.5, beta: 0.05)
+    private let scrollFilterY = OneEuro(minCutoff: 1.5, beta: 0.05)
+    /// 기준점 주변 정지 구간 (손 크기 palmScale 단위)
+    var scrollDeadZone: CGFloat = 0.25
+    /// 정지 구간을 1 palm 넘었을 때의 속도 (px/s)
+    var scrollSpeedGain: CGFloat = 1600.0
+    var scrollMaxSpeed: CGFloat = 4000.0
 
     // 마우스 상태 & 240Hz 보간 엔진 (lock으로 보호)
     private let lock = NSLock()
@@ -116,14 +145,12 @@ final class GestureEngine {
 
     private(set) var isPressed = false
     private var isDragging = false
-    private var isByCurl = false
-    /// 손이 처음부터 약지/새끼를 접은 채(👆) 진입했을 때 오클릭을 막기 위한 무장 플래그
-    private var isCurlArmed = false
-    private var openHandStreak = 0
+    /// 손이 처음부터 엄지를 검지에 붙인 채 진입했을 때 오클릭을 막기 위한 무장 플래그 (엄지가 펴진 게 확인돼야 무장)
+    private var isThumbArmed = false
+    private var thumbOpenStreak = 0
     private var pressStartTime: CFAbsoluteTime = 0.0
     private var lastFrameTime: CFAbsoluteTime = 0.0
     private var pressAnchorPoint: CGPoint = .zero
-    private var pressStartRawPoint: CGPoint = .zero
 
     // 더블/트리플 클릭 카운터
     private var lastClickTime: CFAbsoluteTime = 0.0
@@ -210,7 +237,7 @@ final class GestureEngine {
                 self.tick()
 
                 self.lock.lock()
-                let idle = !self.isMoving && !self.isPressed
+                let idle = !self.isMoving && !self.isPressed && !self.isScrolling
                 self.lock.unlock()
 
                 usleep(idle ? 16_666 : 4_166)
@@ -246,7 +273,34 @@ final class GestureEngine {
             return
         }
 
-        guard _isEnabled, !isScrolling, let t = targetPoint else {
+        // 조이스틱 스크롤: 240Hz로 속도 × 경과시간만큼 서브픽셀 누적 후 배출 (카메라 30fps여도 부드럽게)
+        if isScrolling {
+            let dt = lastScrollTickTime > 0 ? min(max(now - lastScrollTickTime, 0), 0.05) : 0
+            lastScrollTickTime = now
+            // 프레임이 0.25초 이상 끊기면 마지막 속도로 계속 흘러가지 않게 정지
+            let target = (lastFrameTime > 0 && now - lastFrameTime > 0.25) ? .zero : scrollVelocity
+            // 지수 수렴: 카메라 프레임마다 바뀌는 목표 속도를 240Hz로 부드럽게 따라감
+            let k = dt > 0 ? CGFloat(1 - exp(-dt / scrollEaseTime)) : 0
+            let v = CGVector(dx: scrollVelocitySmoothed.dx + (target.dx - scrollVelocitySmoothed.dx) * k,
+                             dy: scrollVelocitySmoothed.dy + (target.dy - scrollVelocitySmoothed.dy) * k)
+            scrollVelocitySmoothed = v
+            let rx = scrollRemainder.dx + v.dx * CGFloat(dt)
+            let ry = scrollRemainder.dy + v.dy * CGFloat(dt)
+            let sx = Int32(rx.rounded(.towardZero))
+            let sy = Int32(ry.rounded(.towardZero))
+            scrollRemainder = CGVector(dx: rx - CGFloat(sx), dy: ry - CGFloat(sy))
+            scrollDebugLog?(String(format: "tick,%.4f,%.4f,%.1f,%.1f,%d,%d", now, dt, v.dx, v.dy, sx, sy))
+            if sx != 0 || sy != 0 {
+                // lock 안에서 보내 ended 이후에 changed가 끼어드는 순서 역전을 막는다 (post는 비차단)
+                let phase: CGScrollPhase = scrollGestureActive ? .changed : .began
+                scrollGestureActive = true
+                postScroll(dx: sx, dy: sy, phase: phase, at: scrollCursorPoint)
+            }
+            lock.unlock()
+            return
+        }
+
+        guard _isEnabled, let t = targetPoint else {
             lock.unlock()
             return
         }
@@ -307,20 +361,25 @@ final class GestureEngine {
             return
         }
 
-        guard let hand = hand, hand.isValid, let indexTip = hand.indexTip, let thumbTip = hand.thumbTip else {
+        guard let hand = hand, hand.isValid, let indexTip = hand.indexTip, hand.thumbTip != nil else {
             let wasPressed = isPressed
             let wasDragging = isDragging
             let releasePt = wasDragging ? (currentPoint ?? lastCursorPoint) : pressAnchorPoint
             isPressed = false
             isDragging = false
             isScrolling = false
-            isCurlArmed = false
-            isRightClickArmed = true
+            isThumbArmed = false
+            thumbOpenStreak = 0
+            touchStreak = 0
+            scrollMatchStreak = 0
+            _clickProgress = 0
             isApproachingClick = false
             filterX.reset()
             filterY.reset()
-            lastScrollY = nil
-            scrollRemainderY = 0.0
+            resetScrollLocked()
+            // 손을 다시 잡으면 커서가 손 위치로 점프하지 않고 그 자리에서 이어지도록
+            needsReanchor = true
+            lastRawNoOffset = nil
             let pt = lastCursorPoint
             lock.unlock()
 
@@ -332,11 +391,21 @@ final class GestureEngine {
         }
 
         let now = hand.timestamp > 0 ? hand.timestamp : CFAbsoluteTimeGetCurrent()
+        if lastFrameTime > 0 && now - lastFrameTime > maxFrameGap {
+            // 프레임이 끊겼다 돌아오면 이전 프레임과 연속으로 보지 않고 확정 단계를 처음부터
+            thumbOpenStreak = 0
+            touchStreak = 0
+            scrollMatchStreak = 0
+        }
         lastFrameTime = now
 
-        // 1. 거울 반전 및 상하 반전
+        // 1. 거울 반전 및 상하 반전 (조준 Y는 옵션에 따라 검지 끝과 MCP를 섞음)
+        var aimY = indexTip.y
+        if aimBlendKnuckle, let mcp = hand.indexMCP {
+            aimY = indexTip.y * 0.4 + mcp.y * 0.6
+        }
         let mirrorX = 1.0 - indexTip.x
-        let invertY = 1.0 - indexTip.y
+        let invertY = 1.0 - aimY
 
         // 2. Active ROI 매핑
         let clampedX = min(max((mirrorX - roiMinX) / (roiMaxX - roiMinX), 0.0), 1.0)
@@ -348,41 +417,58 @@ final class GestureEngine {
 
         // 4. 화면 좌표 매핑
         let screen = mainDisplayBounds(now: now)
-        let targetX = screen.origin.x + CGFloat(smoothX) * screen.width
-        let targetY = screen.origin.y + CGFloat(smoothY) * screen.height
-        let rawTarget = CGPoint(x: targetX, y: targetY)
+        let rawNoOffset = CGPoint(x: screen.origin.x + CGFloat(smoothX) * screen.width,
+                                  y: screen.origin.y + CGFloat(smoothY) * screen.height)
+        if needsReanchor {
+            needsReanchor = false
+            if let cur = currentPoint {
+                cursorOffset = CGVector(dx: cur.x - rawNoOffset.x, dy: cur.y - rawNoOffset.y)
+            }
+        } else if let last = lastRawNoOffset, cursorOffset != .zero {
+            let moved = hypot(rawNoOffset.x - last.x, rawNoOffset.y - last.y)
+            let k = CGFloat(exp(-Double(moved / reanchorDecayDistance)))
+            cursorOffset = CGVector(dx: cursorOffset.dx * k, dy: cursorOffset.dy * k)
+            if abs(cursorOffset.dx) < 0.5 && abs(cursorOffset.dy) < 0.5 { cursorOffset = .zero }
+        }
+        lastRawNoOffset = rawNoOffset
+        var rawTarget = CGPoint(x: min(max(rawNoOffset.x + cursorOffset.dx, screen.minX), screen.maxX - 1),
+                                y: min(max(rawNoOffset.y + cursorOffset.dy, screen.minY), screen.maxY - 1))
         lastCursorPoint = rawTarget
 
-        // 거리 및 관절 비율 계산 (종횡비 보정 적용됨)
-        let rawDist = hand.distance(indexTip, thumbTip)
-        let pinchRatio = hand.pinchRatio ?? 1.0
-        let middlePinchRatio = hand.middlePinchRatio ?? 1.0
-        let curlRatio = hand.lowerFingerCurlRatio
+        let thumbRatio = hand.thumbIndexRatio ?? 1.0
         // 신뢰도 게이트는 클릭 '진입'에만 적용. 해제·이동은 그대로 두어 누른 채 끊기는 일을 막는다.
-        let pinchTipsReliable = min(hand.confidence(.thumbTip), hand.confidence(.indexTip)) >= minClickConfidence
-        let rightTipsReliable = min(hand.confidence(.thumbTip), hand.confidence(.middleTip)) >= minClickConfidence
-        if middlePinchRatio > rightPinchRelease {
-            isRightClickArmed = true
-        }
+        let thumbReliable = hand.confidence(.thumbTip) >= minClickConfidence
 
-        // 약지/새끼손가락이 연속 4프레임 이상 확실히 펴진 상태가 확인되면 curl 클릭 무장
-        if curlRatio >= curlThresholdExit {
-            openHandStreak += 1
-            if openHandStreak >= 4 {
-                isCurlArmed = true
+        // 엄지를 벌린 상태가 3프레임 이상 그리고 armMinDuration 이상 이어지면 클릭 무장
+        if thumbRatio >= thumbTouchExit {
+            if thumbOpenStreak == 0 { thumbOpenSince = now }
+            thumbOpenStreak += 1
+            if thumbOpenStreak >= 3 && now - thumbOpenSince >= armMinDuration - 1e-6 {
+                isThumbArmed = true
             }
-        } else if curlRatio < curlThresholdEnter {
-            openHandStreak = 0
+        } else if thumbRatio < thumbTouchEnter {
+            thumbOpenStreak = 0
         }
 
-        let mode = clickTriggerMode
-        let isPinchActive = (mode == .pinch || mode == .both)
-        let isCurlActive = (mode == .fingerCurl || mode == .both)
+        // 엄지 붙임이 2프레임 이상 그리고 touchConfirmDuration 이상 이어져야 누름으로 확정
+        if thumbRatio < thumbTouchEnter {
+            if touchStreak == 0 { touchSince = now }
+            touchStreak += 1
+        } else {
+            touchStreak = 0
+        }
+        let touchConfirmed = touchStreak >= 2 && now - touchSince >= touchConfirmDuration - 1e-6
 
-        // 핀치/접기 접근 중 여부 (커서 브레이킹 및 클린 호버 히스토리 분리용)
-        let approachingPinch = isPinchActive && (pinchRatio < 0.55)
-        let approachingCurl = isCurlActive && isCurlArmed && (curlRatio < 0.54)
-        isApproachingClick = approachingPinch || approachingCurl
+        // 엄지가 검지로 다가오는 중인지 여부 (커서 브레이킹 및 클린 호버 히스토리 분리용)
+        isApproachingClick = isThumbArmed && thumbRatio < thumbTouchApproach
+        if isPressed {
+            _clickProgress = 1
+        } else if isThumbArmed {
+            let span = max(thumbTouchApproach - thumbTouchEnter, 0.01)
+            _clickProgress = min(max((thumbTouchApproach - thumbRatio) / span, 0), 1)
+        } else {
+            _clickProgress = 0
+        }
 
         // 히스토리 버퍼 업데이트 (최근 0.6초)
         let recordedPoint = currentPoint ?? rawTarget
@@ -399,102 +485,81 @@ final class GestureEngine {
 
         // 5. 제스처 판정
 
-        // A. 엄지-중지 우클릭 감지 (좌클릭/드래그/스크롤 중이 아닐 때)
-        if !isPressed && !isScrolling && isRightClickArmed && rightTipsReliable
-            && middlePinchRatio < rightPinchThreshold && pinchRatio > pinchThresholdEnter {
-            if now - lastRightClickTime > 0.55 {
-                lastRightClickTime = now
-                isRightClickArmed = false
-                let clickPt = cleanHoverHistory.last?.p ?? currentPoint ?? rawTarget
-                lock.unlock()
-                triggerRightClick(at: clickPt)
-                updateState(.rightClicking, point: clickPt, ratio: middlePinchRatio)
-                return
-            }
-        }
-
-        // B. 두 손가락 스크롤 제스처 판정 (검지+중지만 나란히 붙여서 펴고, 약지+새끼는 접은 상태에서 상하 이동)
+        // B. 두 손가락 조이스틱 스크롤 (검지+중지 나란히 펴고 약지+새끼 접은 자세 = 스크롤 모드)
+        //    자세를 취한 순간의 손 위치가 기준점. 손을 옮긴 방향으로, 멀리 옮길수록 빠르게 스크롤.
         let scrollPoseMatched = hand.isTwoFingerScrollPose(currentlyScrolling: isScrolling)
         if scrollPoseMatched {
+            if scrollMatchStreak == 0 { scrollMatchSince = now }
             scrollMatchStreak += 1
         } else {
             scrollMatchStreak = 0
         }
-        let withinScrollGrace = isScrolling && (now - lastScrollValidTime < 0.06) && (pinchRatio > 0.40)
-        let shouldScroll = (isScrolling && (scrollPoseMatched || withinScrollGrace)) || (!isScrolling && scrollMatchStreak >= 3)
+        let withinScrollGrace = isScrolling && (now - lastScrollValidTime < 0.06)
+        let scrollConfirmed = scrollMatchStreak >= 3 && now - scrollMatchSince >= scrollConfirmDuration - 1e-6
+        let shouldScroll = (isScrolling && (scrollPoseMatched || withinScrollGrace)) || (!isScrolling && scrollConfirmed)
 
         if shouldScroll && !isDragging {
             if !isScrolling {
-                scrollFilterY.reset()
-                lastScrollY = nil
-                scrollRemainderY = 0.0
+                resetScrollLocked()
+                scrollCursorPoint = currentPoint ?? rawTarget
             }
             if scrollPoseMatched {
                 lastScrollValidTime = now
             }
-            // 만약 스크롤 자세 진입 직전에 약지/새끼 접힘 때문에 아직 드래그 전인 isPressed가 걸렸다면 즉시 해제
+            // 스크롤 자세 진입 직전에 엄지 붙임으로 아직 드래그 전인 isPressed가 걸렸다면 즉시 해제 (mouseDown은 아직 안 나감)
             if isPressed && !isDragging {
                 isPressed = false
             }
             isScrolling = true
 
-            let midY = hand.middleTip?.y ?? indexTip.y
-            let avgInvertY = 1.0 - ((indexTip.y + midY) * 0.5)
-            let clampedScrollY = min(max((avgInvertY - roiMinY) / (roiMaxY - roiMinY), 0.0), 1.0)
-            let currentSmoothY = CGFloat(scrollFilterY.filter(Double(clampedScrollY), t: now))
-            var pixelStepsToSend: Int32 = 0
-            let scrollAnchor = currentPoint ?? rawTarget
-
-            if let prevY = lastScrollY {
-                let dy = currentSmoothY - prevY
-                // 미세한 움직임도 버리지 않고 서브픽셀 누적기로 축적하여 1px 단위로 즉시 배출
-                if abs(dy) > 0.0001 {
-                    let totalPixels = -dy * scrollGainPixels + scrollRemainderY
-                    let steps = Int32(totalPixels.rounded(.towardZero))
-                    if steps != 0 {
-                        pixelStepsToSend = steps
-                        scrollRemainderY = totalPixels - CGFloat(steps)
-                    } else {
-                        scrollRemainderY = totalPixels
-                    }
-                }
+            // 손 기준점: 검지·중지 MCP 중점 (손가락 끝 떨림과 무관한 손 전체 위치). 거울 반전 + 종횡비 보정 좌표.
+            let ref = hand.scrollReferencePoint ?? indexTip
+            let hx = CGFloat(scrollFilterX.filter(Double((1.0 - ref.x) * hand.aspectRatio), t: now))
+            let hy = CGFloat(scrollFilterY.filter(Double(ref.y), t: now))
+            if scrollAnchorHand == nil {
+                scrollAnchorHand = CGPoint(x: hx, y: hy)
+                scrollScale = hand.palmScale
             }
-            lastScrollY = currentSmoothY
-            let tipRatio = hand.indexMiddleTipRatio ?? 0.3
+            let anchorHand = scrollAnchorHand!
+            let scale = scrollScale ?? hand.palmScale
+            let offset = CGVector(dx: (hx - anchorHand.x) / scale, dy: (hy - anchorHand.y) / scale)
+            scrollVelocity = GestureEngine.joystickScrollVelocity(
+                offset: offset, deadZone: scrollDeadZone, gain: scrollSpeedGain, maxSpeed: scrollMaxSpeed)
+            scrollDebugLog?(String(format: "frame,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f",
+                                   now, ref.x, ref.y, hand.palmScale, offset.dx, offset.dy, scrollVelocity.dx, scrollVelocity.dy))
+            let speedRatio = hypot(scrollVelocity.dx, scrollVelocity.dy) / scrollMaxSpeed
+            let pt = scrollCursorPoint
             lock.unlock()
 
-            if pixelStepsToSend != 0 {
-                scroll(pixels: pixelStepsToSend, at: scrollAnchor)
-            }
-            updateState(.scrolling, point: scrollAnchor, ratio: tipRatio)
+            updateState(.scrolling, point: pt, ratio: speedRatio)
             return
         }
 
         if isScrolling {
             isScrolling = false
-            scrollFilterY.reset()
-            lastScrollY = nil
-            scrollRemainderY = 0.0
+            resetScrollLocked()
+            // 스크롤 중 손이 기준점에서 벗어나 있으므로, 커서를 스크롤하던 자리에 그대로 두도록 즉시 재앵커
+            let cur = scrollCursorPoint
+            cursorOffset = CGVector(dx: cur.x - rawNoOffset.x, dy: cur.y - rawNoOffset.y)
+            rawTarget = cur
+            lastCursorPoint = cur
         }
 
-        // C. 좌클릭 / 드래그 판정
-        // 스크롤 자세(검지+중지 밀착 폄) 진행 중에는 약지/새끼 접힘 클릭을 억제하여 오작동 방지
-        let pinchTriggered = isPinchActive && pinchTipsReliable && ((pinchRatio < pinchThresholdEnter) || (rawDist < pinchRawDistMax))
-        let curlTriggered = isCurlActive && isCurlArmed && !scrollPoseMatched && (curlRatio < curlThresholdEnter)
-        let clickTriggered = pinchTriggered || curlTriggered
+        // C. 좌클릭 / 드래그 판정: 엄지를 검지에 붙이면 누름, 벌리면 뗌
+        // 스크롤 자세(검지+중지 밀착 폄) 중에는 엄지가 검지에 붙어 있어도 클릭하지 않음
+        let clickTriggered = isThumbArmed && thumbReliable && !scrollPoseMatched && touchConfirmed
 
         if !isPressed {
             // 미누름 상태
             if clickTriggered {
                 isPressed = true
-                isByCurl = curlTriggered && !pinchTriggered
                 isDragging = false
                 pressStartTime = now
-                pressStartRawPoint = rawTarget
+                pressStartHand = CGPoint(x: (1.0 - indexTip.x) * hand.aspectRatio, y: indexTip.y)
 
-                // 핀치/접기 시작 직전의 안정된 호버 좌표를 앵커로 선택
-                let lookback: CFAbsoluteTime = isByCurl ? 0.08 : 0.14
-                let rollbackTime = now - lookback
+                // 엄지를 붙이기 직전의 안정된 호버 좌표를 앵커로 선택 (엄지가 검지를 밀어 생기는 흔들림 제거)
+                // 확정 대기(touchConfirmDuration)만큼 늦게 눌리므로, 엄지가 처음 붙은 시점 기준으로 되돌아본다
+                let rollbackTime = touchSince - 0.05
                 let anchor = cleanHoverHistory.last(where: { $0.t <= rollbackTime })?.p
                     ?? cleanHoverHistory.last?.p
                     ?? history.last(where: { $0.t <= rollbackTime })?.p
@@ -504,16 +569,13 @@ final class GestureEngine {
                 pressAnchorPoint = anchor
                 targetPoint = anchor
                 currentPoint = anchor
-
-                let state: GestureState = isByCurl ? .fingerCurled : .pinching
-                let ratioVal = isByCurl ? curlRatio : pinchRatio
                 lock.unlock()
 
                 // 앵커 위치로 커서를 옮기고 hover(mouseMoved)만 먼저 보장.
                 // 실제 leftMouseDown은 짧은 탭 릴리즈 시점 또는 드래그 확정 시점에 주입하여 하이퍼링크 클릭 씹힘을 원천 방지!
                 warpCursor(to: anchor)
                 postMouseMoved(at: anchor, dx: 0, dy: 0)
-                updateState(state, point: anchor, ratio: ratioVal)
+                updateState(.thumbTouching, point: anchor, ratio: thumbRatio)
             } else {
                 // 일반 포인팅 이동
                 if now >= postClickFreezeUntil {
@@ -523,22 +585,16 @@ final class GestureEngine {
                     }
                 }
                 let displayPt = (now < postClickFreezeUntil) ? pressAnchorPoint : rawTarget
-                let ratioVal = isCurlActive ? curlRatio : pinchRatio
                 lock.unlock()
-                updateState(.pointing, point: displayPt, ratio: ratioVal)
+                updateState(.pointing, point: displayPt, ratio: thumbRatio)
             }
         } else {
-            // 이미 제스처 누름(홀드) 유지 중인 상태
-            let releaseCondition: Bool
-            if isByCurl {
-                releaseCondition = curlRatio > curlThresholdExit
-            } else {
-                releaseCondition = (pinchRatio > pinchThresholdExit) && (rawDist > pinchRawDistMax * 1.22)
-            }
-
+            // 이미 엄지를 붙인(홀드) 상태
+            let releaseCondition = thumbRatio > thumbTouchExit
             let elapsed = now - pressStartTime
-            // 중요: 롤백된 pressAnchorPoint가 아니라 제스처 시작 시점의 손 좌표(pressStartRawPoint) 대비 이동량으로 드래그 판정!
-            let handMoveDist = hypot(rawTarget.x - pressStartRawPoint.x, rawTarget.y - pressStartRawPoint.y)
+            // 롤백된 pressAnchorPoint가 아니라 누른 시점의 검지 위치 대비 손 이동량(palm 단위)으로 드래그 판정
+            let handMoveDist = hypot((1.0 - indexTip.x) * hand.aspectRatio - pressStartHand.x,
+                                     indexTip.y - pressStartHand.y) / hand.palmScale
 
             if releaseCondition {
                 isPressed = false
@@ -553,50 +609,33 @@ final class GestureEngine {
                     postClickFreezeUntil = now + 0.10
                     targetPoint = anchor
                     currentPoint = anchor
-                    let ratioVal = isByCurl ? curlRatio : pinchRatio
                     lock.unlock()
 
                     warpCursor(to: anchor)
                     postMouseMoved(at: anchor, dx: 0, dy: 0)
                     postMouseDown(at: anchor, clicks: clicks)
                     postMouseUp(at: anchor, clicks: clicks)
-                    updateState(.pointing, point: anchor, ratio: ratioVal)
+                    updateState(.pointing, point: anchor, ratio: thumbRatio)
                 } else {
                     // 드래그 종료: 현재 위치에서 MouseUp
                     targetPoint = rawTarget
                     currentPoint = dragReleasePt
-                    let ratioVal = isByCurl ? curlRatio : pinchRatio
                     lock.unlock()
 
                     postMouseUp(at: dragReleasePt, clicks: 1)
-                    updateState(.pointing, point: dragReleasePt, ratio: ratioVal)
+                    updateState(.pointing, point: dragReleasePt, ratio: thumbRatio)
                 }
             } else {
-                // 만약 손을 폈다가(🖐️) 검지만 남기고 주먹을 쥐는(👆) 포인팅 자세로 바꿔 이동 중인 경우:
-                // 약지/새끼 접힘(isByCurl)이 0.45초 이상 유지되거나 손을 34px 이상 이동하면 클릭/드래그가 아닌 '👆 포인팅 전환'으로 인식하여 즉시 커서 이동 재개!
-                if isByCurl && !isDragging && (handMoveDist > 34.0 || elapsed > 0.48) {
-                    isPressed = false
-                    isCurlArmed = false
-                    openHandStreak = 0
-                    targetPoint = rawTarget
-                    let ratioVal = isPinchActive ? pinchRatio : curlRatio
-                    lock.unlock()
-                    updateState(.pointing, point: rawTarget, ratio: ratioVal)
-                    return
-                }
-
-                // 엄지+검지 핀치 홀드 후 이동 시 드래그 진입 (0.35초 이상 유지 + 36px 이상 이동)
+                // 엄지를 붙인 채 이동하면 드래그 진입 (0.35초 + 0.25 palm, 또는 0.55초 + 0.15 palm)
                 var justStartedDragging = false
-                if !isByCurl && !isDragging && ((elapsed > 0.35 && handMoveDist > 36.0) || (elapsed > 0.55 && handMoveDist > 20.0)) {
+                if !isDragging && ((elapsed > 0.35 && handMoveDist > dragStartDistance)
+                                   || (elapsed > 0.55 && handMoveDist > dragStartDistanceSlow)) {
                     isDragging = true
                     justStartedDragging = true
                 }
 
                 let draggingNow = isDragging
                 let anchor = pressAnchorPoint
-                let ratioVal = isByCurl ? curlRatio : pinchRatio
-                let holdState: GestureState = isByCurl ? .fingerCurled : .pinching
-
                 if draggingNow {
                     targetPoint = rawTarget
                 }
@@ -609,9 +648,9 @@ final class GestureEngine {
                 }
 
                 if draggingNow {
-                    updateState(.dragging, point: rawTarget, ratio: ratioVal)
+                    updateState(.dragging, point: rawTarget, ratio: thumbRatio)
                 } else {
-                    updateState(holdState, point: anchor, ratio: ratioVal)
+                    updateState(.thumbTouching, point: anchor, ratio: thumbRatio)
                 }
             }
         }
@@ -676,30 +715,47 @@ final class GestureEngine {
         ev.post(tap: .cghidEventTap)
     }
 
-    private func triggerRightClick(at point: CGPoint) {
-        warpCursor(to: point)
-        postMouseMoved(at: point, dx: 0, dy: 0)
-        emit(.rightDown, at: point)
-        emit(.rightUp, at: point)
+    /// 트랙패드와 같은 단계(began/changed/ended)를 실은 픽셀 스크롤. 단계가 없으면 브라우저 등이 이벤트마다
+    /// 자체 휠 애니메이션을 걸어 끊겨 보인다. wheel1 = 세로(+위), wheel2 = 가로(+왼쪽).
+    private func postScroll(dx: Int32, dy: Int32, phase: CGScrollPhase, at point: CGPoint) {
+        if phase == .began { emit(.scrollBegan, at: point) }
+        if phase == .ended { emit(.scrollEnded, at: point) } else { emit(.scroll(dx: dx, dy: dy), at: point) }
         guard !suppressSystemEvents else { return }
-        if let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: point, mouseButton: .right) {
-            down.setIntegerValueField(.mouseEventClickState, value: 1)
-            down.post(tap: .cghidEventTap)
-        }
-        if let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: point, mouseButton: .right) {
-            up.setIntegerValueField(.mouseEventClickState, value: 1)
-            up.post(tap: .cghidEventTap)
-        }
-    }
-
-    private func scroll(pixels: Int32, at point: CGPoint) {
-        emit(.scroll(pixelDeltaY: pixels), at: point)
-        guard !suppressSystemEvents else { return }
-        // PointerEngine.swift와 동일한 픽셀 단위 휠 스크롤 + 현재 커서 위치 지정
         guard let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
-                               wheel1: pixels, wheel2: 0, wheel3: 0) else { return }
+                               wheel1: dy, wheel2: dx, wheel3: 0) else { return }
+        ev.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue))
         ev.location = point
         ev.post(tap: .cghidEventTap)
+    }
+
+    private func resetScrollLocked() {
+        if scrollGestureActive {
+            postScroll(dx: 0, dy: 0, phase: .ended, at: scrollCursorPoint)
+        }
+        scrollGestureActive = false
+        scrollFilterX.reset()
+        scrollFilterY.reset()
+        scrollAnchorHand = nil
+        scrollScale = nil
+        scrollVelocity = .zero
+        scrollVelocitySmoothed = .zero
+        scrollRemainder = .zero
+        lastScrollTickTime = 0.0
+    }
+
+    /// 조이스틱 스크롤 속도 (px/s). offset: 기준점 대비 손 이동량(palm 단위, x = 사용자 기준 오른쪽, y = 위).
+    /// 반환: dx = 가로 휠(wheel2, +왼쪽), dy = 세로 휠(wheel1, +위). 손을 올리면 위로, 오른쪽으로 옮기면 오른쪽 내용이 보이도록.
+    static func joystickScrollVelocity(offset: CGVector, deadZone: CGFloat, gain: CGFloat, maxSpeed: CGFloat) -> CGVector {
+        var ox = offset.dx, oy = offset.dy
+        // 주축 스냅: 한 축이 다른 축의 절반도 안 되면 버려서 세로 스크롤 중 가로로 새는 것 방지
+        if abs(ox) < abs(oy) * 0.5 { ox = 0 }
+        if abs(oy) < abs(ox) * 0.5 { oy = 0 }
+        let mag = hypot(ox, oy)
+        let excess = hypot(offset.dx, offset.dy) - deadZone
+        guard mag > 0, excess > 0 else { return .zero }
+        // 정지 구간을 넘은 거리에 지수 1.6을 적용해 가까이서는 미세하게, 멀리서는 빠르게
+        let speed = min(maxSpeed, gain * pow(excess, 1.6))
+        return CGVector(dx: -speed * ox / mag, dy: speed * oy / mag)
     }
 
     func releaseAll() {
@@ -710,7 +766,14 @@ final class GestureEngine {
         isPressed = false
         isDragging = false
         isScrolling = false
-        isCurlArmed = false
+        isThumbArmed = false
+        thumbOpenStreak = 0
+        touchStreak = 0
+        scrollMatchStreak = 0
+        _clickProgress = 0
+        cursorOffset = .zero
+        needsReanchor = false
+        lastRawNoOffset = nil
         isApproachingClick = false
         targetPoint = nil
         currentPoint = nil
@@ -720,8 +783,7 @@ final class GestureEngine {
         cleanHoverHistory.removeAll()
         filterX.reset()
         filterY.reset()
-        lastScrollY = nil
-        scrollRemainderY = 0.0
+        resetScrollLocked()
         lock.unlock()
 
         if wasPressed && wasDragging {
